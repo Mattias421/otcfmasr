@@ -1,7 +1,5 @@
 import torch
-import numpy as np
 from pathlib import Path
-import matplotlib.pyplot as plt
 import argparse # Import argparse
 
 def l2_norm(emb_dir, split):
