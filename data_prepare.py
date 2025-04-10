@@ -1,182 +1,109 @@
-import whisper
-import torch
+import json
 import os
-import argparse
-from pathlib import Path
-from tqdm import tqdm
 
-def process_file(model, audio_path, output_emb_path, output_txt_path, device):
-    """
-    Processes a single audio file to extract Whisper embedding and transcription.
+from speechbrain.utils.data_utils import get_all_files
+from speechbrain.utils.logger import get_logger
 
-    Args:
-        model: The loaded Whisper model.
-        audio_path (str): Path to the input WAV file.
-        output_emb_path (str): Path to save the output embedding (.pt).
-        output_txt_path (str): Path to save the output transcription (.txt).
-        device (str): The device to use ('cuda' or 'cpu').
-    """
-    try:
-        # 1. Load audio
-        #    Using transcribe directly simplifies loading and processing
-        #    but we need mel separately for embed_audio
-        audio = whisper.load_audio(audio_path)
-        audio = whisper.pad_or_trim(audio)
+logger = get_logger(__name__)
 
-        # 2. Calculate log-Mel spectrogram for embedding
-        #    Process the whole audio
-        mel = whisper.log_mel_spectrogram(audio, n_mels=model.dims.n_mels).to(device)
 
-        # 3. Get audio embedding
-        #    embed_audio returns shape (n_segments, n_ctx, d_model) or (n_segments, d_model)
-        #    Let's run the encoder directly for potentially better full-file representation
-        #    or use embed_audio and aggregate. Using embed_audio as per example.
-        #    Result shape: [n_segments, D_MODEL]
-        with torch.no_grad():
-             # Pad or trim is not strictly needed here if we want the whole file's embedding
-             # But let's keep mel calculation consistent
-            audio_features = model.embed_audio(mel[None, :, :]) # Shape: [n_segments, D_MODEL]
-
-            # Aggregate embeddings (e.g., mean pooling over segments)
-            # If only one segment, this just removes the dimension
-            # aggregated_embedding = audio_features.mean(dim=0) # Shape: [D_MODEL]
-
-        # 4. Transcribe audio for text
-        #    Using transcribe is robust as it handles language detection etc.
-        #    It might recompute the mel spec internally, but it's convenient.
-        #    Provide the path directly for simplicity.
-        result = model.transcribe(audio_path)
-        transcription = result['text']
-
-        # 5. Save embedding
-        #    Ensure output directory exists
-        Path(output_emb_path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(audio_features.cpu(), output_emb_path) # Save on CPU
-
-        # 6. Save transcription
-        #    Ensure output directory exists
-        Path(output_txt_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_txt_path, 'w', encoding='utf-8') as f:
-            f.write(transcription)
-
-        return True # Indicate success
-
-    except Exception as e:
-        print(f"\n[!] Error processing {audio_path}: {e}")
-        # Optional: Clean up partially created files if needed
-        if Path(output_emb_path).exists():
-            os.remove(output_emb_path)
-        if Path(output_txt_path).exists():
-            os.remove(output_txt_path)
-        return False # Indicate failure
-
-def main(args):
-    """
-    Main function to orchestrate the dataset processing.
-    """
-    input_base = Path(args.input_dir)
-    output_base = Path(args.output_dir)
-    output_emb_dir = output_base / "audio_emb"
-    output_txt_dir = output_base / "txt"
-
-    if not input_base.is_dir():
-        print(f"Error: Input directory '{args.input_dir}' not found.")
+def prepare_data(
+    data_folder, whisper_model, save_json_train, save_json_valid, save_json_test
+):
+    # Check if this phase is already done (if so, skip it)
+    if skip(save_json_train, save_json_valid, save_json_test):
+        logger.info("Preparation completed in previous run, skipping.")
         return
 
-    print(f"Loading Whisper model: {args.model_name}...")
-    device = args.device
-    if device == "cuda" and not torch.cuda.is_available():
-        print("Warning: CUDA requested but not available, falling back to CPU.")
-        device = "cpu"
-    elif device is None:
-         device = "cuda" if torch.cuda.is_available() else "cpu"
+    emb_folder = os.path.join(data_folder, f"VB+DMD_wspr_{whisper_model}")
 
-    print(f"Using device: {device}")
-    try:
-        model = whisper.load_model(args.model_name, device=device, download_root="./.cache")
-    except Exception as e:
-        print(f"Error loading Whisper model: {e}")
-        print("Please ensure 'openai-whisper' and its dependencies (like ffmpeg) are installed correctly.")
-        return
+    if not emb_folder.exists():
+        logger.info("f{emb_folder} doesn't exist, computing audio embeddings")
+        wav_folder = os.path.join(data_folder, "VB+DMD")
 
-    splits = ["train", "test", "valid"]
-    conditions = ["noisy", "clean"]
+        from .get_wspr_emb import get_wspr_emb
 
-    print(f"Starting processing from: {input_base}")
-    print(f"Output will be saved to: {output_base}")
+        get_wspr_emb(
+            input_dir=wav_folder,
+            output_dir=emb_folder,
+            model_name=whisper_model,
+            device_arg="cuda",
+            force_overwrite=True,
+        )
+    else:
+        logger.info(f"Whisper {whisper_model} embeddings found in {emb_folder}")
 
-    total_files_processed = 0
-    total_files_skipped = 0
-    total_errors = 0
+    train_folder = os.path.join(emb_folder, "audio_emb", "train")
+    valid_folder = os.path.join(emb_folder, "audio_emb", "valid")
+    test_folder = os.path.join(emb_folder, "audio_emb", "test")
 
-    for split in splits:
-        for condition in conditions:
-            current_input_dir = input_base / split / condition
-            current_output_emb_dir = output_emb_dir / split / condition
-            current_output_txt_dir = output_txt_dir / split / condition
-
-            if not current_input_dir.is_dir():
-                print(f"Warning: Directory not found, skipping: {current_input_dir}")
-                continue
-
-            print(f"\nProcessing: {split}/{condition}")
-
-            # Find all .wav files
-            wav_files = sorted(list(current_input_dir.glob("*.wav")))
-            if not wav_files:
-                print(f"No .wav files found in {current_input_dir}")
-                continue
-
-            # Create output dirs for the current split/condition batch
-            # Doing it here avoids repeated checks in the loop
-            current_output_emb_dir.mkdir(parents=True, exist_ok=True)
-            current_output_txt_dir.mkdir(parents=True, exist_ok=True)
-
-            progress_bar = tqdm(wav_files, desc=f"{split}/{condition}", unit="file")
-            for wav_path in progress_bar:
-                file_stem = wav_path.stem
-                output_emb_path = current_output_emb_dir / f"{file_stem}.pt"
-                output_txt_path = current_output_txt_dir / f"{file_stem}.txt"
-
-                # Check if both output files already exist and skip if requested
-                if not args.force_overwrite and output_emb_path.exists() and output_txt_path.exists():
-                    total_files_skipped += 1
-                    continue
-
-                # Update progress bar description
-                progress_bar.set_postfix_str(f"Processing {wav_path.name}", refresh=True)
-
-                # Process the file
-                success = process_file(model, str(wav_path), str(output_emb_path), str(output_txt_path), device)
-
-                if success:
-                    total_files_processed += 1
-                else:
-                    total_errors += 1
-
-                # Clear postfix after processing
-                progress_bar.set_postfix_str("", refresh=True)
+    # List files and create manifest from list
+    logger.info(f"Creating {save_json_train}, {save_json_valid}, and {save_json_test}")
+    extension = [".pt"]
+    wav_list_train = get_all_files(train_folder, match_and=extension)
+    wav_list_valid = get_all_files(valid_folder, match_and=extension)
+    wav_list_test = get_all_files(test_folder, match_and=extension)
+    create_json(wav_list_train, save_json_train)
+    create_json(wav_list_valid, save_json_valid)
+    create_json(wav_list_test, save_json_test)
 
 
-    print("\n--------------------")
-    print("Processing Summary:")
-    print(f"  Total files processed successfully: {total_files_processed}")
-    print(f"  Total files skipped (already exist): {total_files_skipped}")
-    print(f"  Total errors encountered: {total_errors}")
-    print("--------------------")
+def create_json(wav_list, json_file):
+    """
+    Creates the json file given a list of wav files.
+
+    Arguments
+    ---------
+    wav_list : list of str
+        The list of wav files.
+    json_file : str
+        The path of the output json file
+    """
+
+    # TODO add noisy pt, clean pt, noisy transctription, clean transctription, true transctription
+    # Processing all the wav files in the list
+    json_dict = {}
+    for wav_file in wav_list:
+        path_parts = wav_file.split(os.path.sep)
+        uttid, _ = os.path.splitext(path_parts[-1])
+        relative_path = os.path.join("{data_root}", *path_parts[-5:])
+
+        # Create entry for this utterance
+        json_dict[uttid] = {"wav": relative_path}
+
+    # Writing the dictionary to the json file
+    with open(json_file, mode="w", encoding="utf-8") as json_f:
+        json.dump(json_dict, json_f, indent=2)
+
+    logger.info(f"{json_file} successfully created!")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Extract Whisper embeddings and transcriptions from VB+DMD dataset.")
-    parser.add_argument("input_dir", type=str, help="Path to the root VB+DMD dataset directory.")
-    parser.add_argument("output_dir", type=str, help="Path to the output directory (e.g., VB+DMD_wspr).")
-    parser.add_argument("--model_name", type=str, default="base",
-                        choices=["turbo", "tiny", "base", "small", "medium", "large", "tiny.en", "base.en", "small.en", "medium.en"],
-                        help="Name of the Whisper model to use (default: base).")
-    parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"],
-                        help="Device to use ('cuda' or 'cpu'). Autodetects if not specified.")
-    parser.add_argument("--force_overwrite", action="store_true",
-                        help="Overwrite existing output files instead of skipping.")
+def skip(*filenames):
+    """
+    Detects if the data preparation has been already done.
+    If the preparation has been done, we can skip it.
 
-    args = parser.parse_args()
-    main(args)
+    Arguments
+    ---------
+    *filenames : tuple
+        The file paths passed here should already exist
+        in order for the preparation to be considered done.
+
+    Returns
+    -------
+    bool
+        if True, the preparation phase can be skipped.
+        if False, it must be done.
+    """
+    for filename in filenames:
+        if not os.path.isfile(filename):
+            return False
+    return True
+
+
+def check_folders(*folders):
+    """Returns False if any passed folder does not exist."""
+    for folder in folders:
+        if not os.path.exists(folder):
+            return False
+    return True
