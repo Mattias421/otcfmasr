@@ -2,7 +2,7 @@ import sys
 
 import torch
 from hyperpyyaml import load_hyperpyyaml
-from mini_librispeech_prepare import prepare_mini_librispeech
+from data_prepare import prepare_data
 
 import speechbrain as sb
 
@@ -253,9 +253,10 @@ if __name__ == "__main__":
     # Data preparation, to be run on only one process.
     if not hparams["skip_prep"]:
         sb.utils.distributed.run_on_main(
-            prepare_mini_librispeech,
+            prepare_data,
             kwargs={
                 "data_folder": hparams["data_folder"],
+                "whisper_model": hparams["whisper_model"],
                 "save_json_train": hparams["train_annotation"],
                 "save_json_valid": hparams["valid_annotation"],
                 "save_json_test": hparams["test_annotation"],

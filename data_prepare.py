@@ -17,7 +17,7 @@ def prepare_data(
 
     emb_folder = os.path.join(data_folder, f"VB+DMD_wspr_{whisper_model}")
 
-    if not emb_folder.exists():
+    if not os.path.exists(emb_folder):
         logger.info("f{emb_folder} doesn't exist, computing audio embeddings")
         wav_folder = os.path.join(data_folder, "VB+DMD")
 
@@ -33,9 +33,9 @@ def prepare_data(
     else:
         logger.info(f"Whisper {whisper_model} embeddings found in {emb_folder}")
 
-    train_folder = os.path.join(emb_folder, "audio_emb", "train")
-    valid_folder = os.path.join(emb_folder, "audio_emb", "valid")
-    test_folder = os.path.join(emb_folder, "audio_emb", "test")
+    train_folder = os.path.join(emb_folder, "audio_emb", "train", "clean")
+    valid_folder = os.path.join(emb_folder, "audio_emb", "valid", "clean")
+    test_folder = os.path.join(emb_folder, "audio_emb", "test", "clean")
 
     # List files and create manifest from list
     logger.info(f"Creating {save_json_train}, {save_json_valid}, and {save_json_test}")
@@ -60,16 +60,39 @@ def create_json(wav_list, json_file):
         The path of the output json file
     """
 
-    # TODO add noisy pt, clean pt, noisy transctription, clean transctription, true transctription
     # Processing all the wav files in the list
     json_dict = {}
     for wav_file in wav_list:
         path_parts = wav_file.split(os.path.sep)
         uttid, _ = os.path.splitext(path_parts[-1])
-        relative_path = os.path.join("{data_root}", *path_parts[-5:])
+        emb_clean = os.path.join("/", *path_parts)
+        path_parts[-2] = "noisy"
+        emb_noisy = os.path.join("/", *path_parts)
+        path_parts[-4] = "txt"
+        path_parts[-1] = f"{uttid}.txt"
+        txt_noisy = os.path.join("/", *path_parts)
+        path_parts[-2] = "clean"
+        txt_clean = os.path.join("/", *path_parts)
+
+        txt_label = os.path.join(
+            "/", *path_parts[:-5], "VB+DMD", "txt", path_parts[-3], path_parts[-1]
+        )
+
+        with open(txt_noisy, "r") as f:
+            txt_noisy = f.read()
+        with open(txt_clean, "r") as f:
+            txt_clean = f.read()
+        with open(txt_label, "r") as f:
+            txt_label = f.read().strip()
 
         # Create entry for this utterance
-        json_dict[uttid] = {"wav": relative_path}
+        json_dict[uttid] = {
+            "txt_noisy": txt_noisy,
+            "txt_clean": txt_clean,
+            "txt_label": txt_label,
+            "path_emb_noisy": emb_noisy,
+            "path_emb_clean": emb_clean,
+        }
 
     # Writing the dictionary to the json file
     with open(json_file, mode="w", encoding="utf-8") as json_f:
