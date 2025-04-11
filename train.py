@@ -262,7 +262,14 @@ if __name__ == "__main__":
                 "save_json_test": hparams["test_annotation"],
             },
         )
-    sb.utils.distributed.run_on_main(hparams["prepare_noise_data"])
+
+    # TODO calc WER of noisy-label, clean-label, noisy-clean
+    from speechbrain.utils.metric_stats import ErrorRateStats
+
+    wer_stats = ErrorRateStats()
+    wer_stats.append("hi", predict="hello", target="hello")
+
+    breakpoint()
 
     # Create dataset objects "train" and "valid"
     datasets = dataio_prep(hparams)
