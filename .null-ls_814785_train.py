@@ -1,13 +1,10 @@
 import sys
-import json
 
 import torch
 from hyperpyyaml import load_hyperpyyaml
 from data_prepare import prepare_data
 
 import speechbrain as sb
-import whisper
-from torchdyn.core import NeuralODE
 
 
 # Brain class for speech enhancement training
@@ -31,18 +28,46 @@ class SEBrain(sb.Brain):
         """
         # We first move the batch to the appropriate device, and
         # compute the features necessary for masking.
+        batch = batch.to(self.device)
+        self.clean_wavs, self.lens = batch.clean_sig
 
-        emb_noisy = batch.emb_noisy.data[:, 0, :, :].to(self.device)
-        emb_clean = batch.emb_clean.data[:, 0, :, :].to(self.device)
+        noisy_wavs, self.lens = self.hparams.wav_augment(self.clean_wavs, self.lens)
 
-        t, xt, ut = self.hparams.flow_matcher.sample_location_and_conditional_flow(
-            emb_noisy, emb_clean
-        )
+        noisy_feats = self.compute_feats(noisy_wavs)
 
-        ut_pred, _ = self.modules.model(xt)
+        # Masking is done here with the "signal approximation (SA)" algorithm.
+        # The masked input is compared directly with clean speech targets.
+        mask = self.modules.model(noisy_feats)
+        predict_spec = torch.mul(mask, noisy_feats)
+
+        # Also return predicted wav, for evaluation. Note that this could
+        # also be used for a time-domain loss term.
+        predict_wav = self.hparams.resynth(torch.expm1(predict_spec), noisy_wavs)
 
         # Return a dictionary so we don't have to remember the order
-        return {"ut": ut, "ut_pred": ut_pred}
+        return {"spec": predict_spec, "wav": predict_wav}
+
+    def compute_feats(self, wavs):
+        """Returns corresponding log-spectral features of the input waveforms.
+
+        Arguments
+        ---------
+        wavs : torch.Tensor
+            The batch of waveforms to convert to log-spectral features.
+
+        Returns
+        -------
+        feats : torch.Tensor
+            The computed features.
+        """
+        # Log-spectral features
+        feats = self.hparams.compute_STFT(wavs)
+        feats = sb.processing.features.spectral_magnitude(feats, power=0.5)
+
+        # Log1p reduces the emphasis on small differences
+        feats = torch.log1p(feats)
+
+        return feats
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given the predicted and targeted outputs.
@@ -61,23 +86,34 @@ class SEBrain(sb.Brain):
         loss : torch.Tensor
             A one-element tensor used for backpropagating the gradient.
         """
-        cfm_loss = torch.mean((predictions["ut_pred"] - predictions["ut"]) ** 2)
+        # Prepare clean targets for comparison
+        clean_spec = self.compute_feats(self.clean_wavs)
 
+        # Directly compare the masked spectrograms with the clean targets
+        loss = sb.nnet.losses.mse_loss(predictions["spec"], clean_spec, self.lens)
+
+        # Append this batch of losses to the loss metric for easy
         self.loss_metric.append(
-            ids=batch.id,
-            predictions=predictions["ut_pred"],
-            targets=predictions["ut"],
+            batch.id,
+            predictions["spec"],
+            clean_spec,
+            self.lens,
+            reduction="batch",
         )
-
-        self.inference(batch)
 
         # Some evaluations are slower, and we only want to perform them
         # on the validation set.
         if stage != sb.Stage.TRAIN:
-            print(self.loss_metric.summarize())
-            print("calc wer")
+            # Evaluate speech intelligibility as an additional metric
+            self.stoi_metric.append(
+                batch.id,
+                predictions["wav"],
+                self.clean_wavs,
+                self.lens,
+                reduction="batch",
+            )
 
-        return cfm_loss
+        return loss
 
     def on_stage_start(self, stage, epoch=None):
         """Gets called at the beginning of each epoch.
@@ -92,20 +128,13 @@ class SEBrain(sb.Brain):
         """
         # Set up statistics trackers for this stage
         self.loss_metric = sb.utils.metric_stats.MetricStats(
-            metric=lambda predictions, targets: torch.mean(
-                (predictions - targets) ** 2
-            )[None]
-        )
-        self.whisper_model = whisper.load_model(
-            self.hparams.whisper_model, device=self.device, download_root="./.cache"
+            metric=sb.nnet.losses.mse_loss
         )
 
         # Set up evaluation-only statistics trackers
         if stage != sb.Stage.TRAIN:
-            self.wer_stats = sb.utils.metric_stats.ErrorRateStats()
-            self.cer_stats = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
-            self.whisper_model = whisper.load_model(
-                self.hparams.whisper_model,
+            self.stoi_metric = sb.utils.metric_stats.MetricStats(
+                metric=sb.nnet.loss.stoi_loss.stoi_loss
             )
 
     def on_stage_end(self, stage, stage_loss, epoch=None):
@@ -129,8 +158,7 @@ class SEBrain(sb.Brain):
         else:
             stats = {
                 "loss": stage_loss,
-                "wer": self.wer_stats.summarize("WER"),
-                "cer": self.cer_stats.summarize("WER"),
+                "stoi": -self.stoi_metric.summarize("average"),
             }
 
         # At the end of validation, we can write stats and checkpoints
@@ -146,37 +174,12 @@ class SEBrain(sb.Brain):
             # unless they have the current best STOI score.
             self.checkpointer.save_and_keep_only(meta=stats, max_keys=["stoi"])
 
-            del self.whisper_model
-
         # We also write statistics about test data to stdout and to the logfile.
         if stage == sb.Stage.TEST:
             self.hparams.train_logger.log_stats(
                 {"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stats,
             )
-
-    @torch.no_grad
-    def inference(self, batch):
-        emb_noisy = batch.emb_noisy.data[:, 0, :, :].to(self.device)
-
-        def vt(t, x, args):
-            model_out, _ = self.modules.model(x)
-            return model_out
-
-        node = NeuralODE(
-            vt, solver="dopri5", sensitivity="adjoint", atol=1e-4, rtol=1e-4
-        )
-        traj = node.trajectory(emb_noisy, t_span=torch.linspace(0, 1, 100))
-
-        emb_clean_pred = traj[-1][0]
-
-        from utils_wspr import transcribe_embeddings
-
-        wspr_result = transcribe_embeddings(
-            self.whisper_model, emb_clean_pred, language="en"
-        )
-
-        print(wspr_result)
 
 
 def dataio_prep(hparams):
@@ -201,16 +204,14 @@ def dataio_prep(hparams):
 
     # Define audio pipeline. Adds noise, reverb, and babble on-the-fly.
     # Of course for a real enhancement dataset, you'd want a fixed valid set.
-    @sb.utils.data_pipeline.takes(
-        "path_emb_noisy", "path_emb_clean", "txt_noisy", "txt_clean", "txt_label"
-    )
-    @sb.utils.data_pipeline.provides(
-        "emb_noisy", "emb_clean", "txt_noisy", "txt_clean", "txt_label"
-    )
-    def audio_pipeline(path_emb_noisy, path_emb_clean, txt_noisy, txt_clean, txt_label):
-        emb_noisy = torch.load(path_emb_noisy)
-        emb_clean = torch.load(path_emb_clean)
-        return emb_noisy, emb_clean, txt_noisy, txt_clean, txt_label
+    @sb.utils.data_pipeline.takes("wav")
+    @sb.utils.data_pipeline.provides("clean_sig")
+    def audio_pipeline(wav):
+        """Load the signal, and pass it and its length to the corruption class.
+        This is done on the CPU in the `collate_fn`.
+        """
+        clean_sig = sb.dataio.dataio.read_audio(wav)
+        return clean_sig
 
     # Define datasets sorted by ascending lengths for efficiency
     datasets = {}
@@ -225,15 +226,8 @@ def dataio_prep(hparams):
             json_path=data_info[dataset],
             replacements={"data_root": hparams["data_folder"]},
             dynamic_items=[audio_pipeline],
-            output_keys=[
-                "id",
-                "emb_noisy",
-                "emb_clean",
-                "txt_noisy",
-                "txt_clean",
-                "txt_label",
-            ],
-        )
+            output_keys=["id", "clean_sig"],
+        ).filtered_sorted(sort_key="length")
     return datasets
 
 
@@ -269,73 +263,13 @@ if __name__ == "__main__":
             },
         )
 
-    wer_stats = hparams["wer_stats"]
+    # TODO calc WER of noisy-label, clean-label, noisy-clean
+    from speechbrain.utils.metric_stats import ErrorRateStats
+
+    wer_stats = ErrorRateStats()
     wer_stats.append("hi", predict="hello", target="hello")
 
-    normalizer = hparams["text_normalizer"]
-
-    def get_txt_list(split, key, normalizer):
-        with open(hparams[f"{split}_annotation"], "r") as f:
-            json_test = json.load(f)
-        if key == "utt_id":
-            return json_test.keys()
-        else:
-            txt = [normalizer(utt[key]) for utt in json_test.values()]
-            return txt
-
-    utt_ids = get_txt_list("test", "utt_id", normalizer)
-    txt_label = get_txt_list("test", "txt_label", normalizer)
-    txt_clean = get_txt_list("test", "txt_clean", normalizer)
-    txt_noisy = get_txt_list("test", "txt_noisy", normalizer)
-
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_clean,
-        target=txt_label,
-    )
-    print(wer_stats.summarize())
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_noisy,
-        target=txt_label,
-    )
-    print(wer_stats.summarize())
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_noisy,
-        target=txt_clean,
-    )
-    print(wer_stats.summarize())
-
-    utt_ids = get_txt_list("valid", "utt_id", normalizer)
-    txt_label = get_txt_list("valid", "txt_label", normalizer)
-    txt_clean = get_txt_list("valid", "txt_clean", normalizer)
-    txt_noisy = get_txt_list("valid", "txt_noisy", normalizer)
-
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_clean,
-        target=txt_label,
-    )
-    print(wer_stats.summarize())
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_noisy,
-        target=txt_label,
-    )
-    print(wer_stats.summarize())
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_noisy,
-        target=txt_clean,
-    )
-    print(wer_stats.summarize())
+    breakpoint()
 
     # Create dataset objects "train" and "valid"
     datasets = dataio_prep(hparams)

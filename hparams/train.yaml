@@ -43,6 +43,15 @@ noise_annotation: noise.csv #The data manifest files are created by the data pre
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
 
+# whisper settings
+text_normalizer: !new:whisper.normalizers.EnglishTextNormalizer
+whisper_model: tiny
+
+# CFM settings
+cfm_sigma: 0.1
+flow_matcher: !new:torchcfm.conditional_flow_matching.ConditionalFlowMatcher
+    sigma: !ref <cfm_sigma>
+
 
 # Training Parameters
 number_of_epochs: 20
@@ -53,14 +62,22 @@ dataloader_options:
     batch_size: !ref <batch_size>
     num_workers: !ref <num_workers>
 
-whisper_model: tiny
 
 
 
 # To design a custom model, either just edit the simple CustomModel
 # class that's listed here, or replace this `!new` call with a line
 # pointing to a different file you've defined.
-model: "model"
+model: !new:speechbrain.lobes.models.transformer.Transformer.TransformerEncoder
+    num_layers: 1
+    nhead: 8
+    d_ffn: 384
+    d_model: 384
+
+# metrics
+wer_stats: !new:speechbrain.utils.metric_stats.ErrorRateStats
+cer_stats: !new:speechbrain.utils.metric_stats.ErrorRateStats
+    split_tokens: True
 
 # The first object passed to the Brain class is this "Epoch Counter"
 # which is saved by the Checkpointer so that training can be resumed
