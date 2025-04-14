@@ -1,5 +1,4 @@
 import sys
-import json
 
 import torch
 from hyperpyyaml import load_hyperpyyaml
@@ -168,15 +167,16 @@ class SEBrain(sb.Brain):
         )
         traj = node.trajectory(emb_noisy, t_span=torch.linspace(0, 1, 100))
 
-        emb_clean_pred = traj[-1][0]
+        emb_clean_pred = traj[-1]
 
         from utils_wspr import transcribe_embeddings
 
         wspr_result = transcribe_embeddings(
-            self.whisper_model, emb_clean_pred, language="en"
+            self.whisper_model, emb_clean_pred, language="en", verbose=True
         )
 
         print(wspr_result)
+        breakpoint()
 
 
 def dataio_prep(hparams):
@@ -269,73 +269,73 @@ if __name__ == "__main__":
             },
         )
 
-    wer_stats = hparams["wer_stats"]
-    wer_stats.append("hi", predict="hello", target="hello")
-
-    normalizer = hparams["text_normalizer"]
-
-    def get_txt_list(split, key, normalizer):
-        with open(hparams[f"{split}_annotation"], "r") as f:
-            json_test = json.load(f)
-        if key == "utt_id":
-            return json_test.keys()
-        else:
-            txt = [normalizer(utt[key]) for utt in json_test.values()]
-            return txt
-
-    utt_ids = get_txt_list("test", "utt_id", normalizer)
-    txt_label = get_txt_list("test", "txt_label", normalizer)
-    txt_clean = get_txt_list("test", "txt_clean", normalizer)
-    txt_noisy = get_txt_list("test", "txt_noisy", normalizer)
-
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_clean,
-        target=txt_label,
-    )
-    print(wer_stats.summarize())
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_noisy,
-        target=txt_label,
-    )
-    print(wer_stats.summarize())
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_noisy,
-        target=txt_clean,
-    )
-    print(wer_stats.summarize())
-
-    utt_ids = get_txt_list("valid", "utt_id", normalizer)
-    txt_label = get_txt_list("valid", "txt_label", normalizer)
-    txt_clean = get_txt_list("valid", "txt_clean", normalizer)
-    txt_noisy = get_txt_list("valid", "txt_noisy", normalizer)
-
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_clean,
-        target=txt_label,
-    )
-    print(wer_stats.summarize())
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_noisy,
-        target=txt_label,
-    )
-    print(wer_stats.summarize())
-    wer_stats.clear()
-    wer_stats.append(
-        ids=utt_ids,
-        predict=txt_noisy,
-        target=txt_clean,
-    )
-    print(wer_stats.summarize())
+    # wer_stats = hparams["wer_stats"]
+    # wer_stats.append("hi", predict="hello", target="hello")
+    #
+    # normalizer = hparams["text_normalizer"]
+    #
+    # def get_txt_list(split, key, normalizer):
+    #     with open(hparams[f"{split}_annotation"], "r") as f:
+    #         json_test = json.load(f)
+    #     if key == "utt_id":
+    #         return json_test.keys()
+    #     else:
+    #         txt = [normalizer(utt[key]) for utt in json_test.values()]
+    #         return txt
+    #
+    # utt_ids = get_txt_list("test", "utt_id", normalizer)
+    # txt_label = get_txt_list("test", "txt_label", normalizer)
+    # txt_clean = get_txt_list("test", "txt_clean", normalizer)
+    # txt_noisy = get_txt_list("test", "txt_noisy", normalizer)
+    #
+    # wer_stats.clear()
+    # wer_stats.append(
+    #     ids=utt_ids,
+    #     predict=txt_clean,
+    #     target=txt_label,
+    # )
+    # print(wer_stats.summarize())
+    # wer_stats.clear()
+    # wer_stats.append(
+    #     ids=utt_ids,
+    #     predict=txt_noisy,
+    #     target=txt_label,
+    # )
+    # print(wer_stats.summarize())
+    # wer_stats.clear()
+    # wer_stats.append(
+    #     ids=utt_ids,
+    #     predict=txt_noisy,
+    #     target=txt_clean,
+    # )
+    # print(wer_stats.summarize())
+    #
+    # utt_ids = get_txt_list("valid", "utt_id", normalizer)
+    # txt_label = get_txt_list("valid", "txt_label", normalizer)
+    # txt_clean = get_txt_list("valid", "txt_clean", normalizer)
+    # txt_noisy = get_txt_list("valid", "txt_noisy", normalizer)
+    #
+    # wer_stats.clear()
+    # wer_stats.append(
+    #     ids=utt_ids,
+    #     predict=txt_clean,
+    #     target=txt_label,
+    # )
+    # print(wer_stats.summarize())
+    # wer_stats.clear()
+    # wer_stats.append(
+    #     ids=utt_ids,
+    #     predict=txt_noisy,
+    #     target=txt_label,
+    # )
+    # print(wer_stats.summarize())
+    # wer_stats.clear()
+    # wer_stats.append(
+    #     ids=utt_ids,
+    #     predict=txt_noisy,
+    #     target=txt_clean,
+    # )
+    # print(wer_stats.summarize())
 
     # Create dataset objects "train" and "valid"
     datasets = dataio_prep(hparams)

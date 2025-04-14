@@ -1,887 +1,517 @@
-import warnings
-import copy
-from typing import List, Optional, Tuple, Union, TYPE_CHECKING
-
 import torch
-from torch import Tensor
-import tqdm
-import numpy as np
+from dataclasses import replace
 
+import warnings
+import tqdm  # Ensure tqdm is imported
+from typing import List, Tuple, Optional, Union  # Ensure these are imported
+from whisper.utils import (  # Make sure necessary utils are imported
+    format_timestamp,
+    make_safe,
+)
+
+# Import constants used in transcribe
 from whisper.audio import (
-    SAMPLE_RATE,
     N_FRAMES,
     HOP_LENGTH,
-    CHUNK_LENGTH,
+    SAMPLE_RATE,
+    FRAMES_PER_SECOND,  # This might need adjustment or reinterpretation
 )
-from whisper.decoding import DecodingOptions, DecodingResult
+
+# Import other necessary components from whisper
+from whisper.tokenizer import get_tokenizer
 from whisper.decoding import (
-    PyTorchInference,
-    BeamSearchDecoder,
-    MaximumLikelihoodRanker,
-    GreedyDecoder,
-    SuppressTokens,
-    SuppressBlank,
-    ApplyTimestampRules,
-)
-from whisper.tokenizer import get_tokenizer, Tokenizer
-from whisper.utils import exact_div, format_timestamp, compression_ratio
-
-N_FRAMES = N_FRAMES // 2  # div by 2 to go from mel frames to audio_emb
-
-if TYPE_CHECKING:
-    from whisper.model import Whisper
+    DecodingOptions,
+    DecodingResult,
+    DecodingTask,
+)  # Add DecodingTask if not already imported
 
 
-class EmbDecodingTask:
-    # https://github.com/Blair-Johnson/batch-whisper
-    # inference: Inference
-    # sequence_ranker: SequenceRanker
-    # decoder: TokenDecoder
-    # logit_filters: List[LogitFilter]
+class EMBDecodingTask(DecodingTask):
+    def _get_audio_features(self, emb):
+        return emb
 
-    def __init__(self, model: "Whisper", options: DecodingOptions):
-        # NOTE: This is the main decoding loop
-        self.model = model
 
-        language = options.language or "en"
-        if isinstance(language, list):
-            self.tokenizers = [
-                get_tokenizer(model.is_multilingual, language=lang, task=options.task)
-                for lang in language
-            ]
-        else:
-            tokenizer = get_tokenizer(
-                model.is_multilingual, language=language, task=options.task
-            )
-            self.tokenizer: Tokenizer = tokenizer
-        self.options: DecodingOptions = self._verify_options(options)
+@torch.no_grad()
+def decode_embeddings(
+    model_wspr,
+    mel,
+    options,
+    **kwargs,
+):
+    """
+    Performs decoding of 30-second audio segment(s), provided as Mel spectrogram(s).
 
-        self.n_group: int = options.beam_size or options.best_of or 1
-        self.n_ctx: int = model.dims.n_text_ctx
-        self.sample_len: int = options.sample_len or model.dims.n_text_ctx // 2
+    Parameters
+    ----------
+    model: Whisper
+        the Whisper model instance
 
-        self.logit_filters = []
-        if isinstance(language, list):
-            self.sot_sequence: List[Tuple[int]] = []
-            for i in range(len(language)):
-                if self.options.without_timestamps:
-                    self.sot_sequence.append(
-                        self.tokenizers[i].sot_sequence_including_notimestamps
-                    )
-                else:
-                    self.sot_sequence.append(self.tokenizers[i].sot_sequence)
+    mel: torch.Tensor, shape = (80, 3000) or (*, 80, 3000)
+        A tensor containing the Mel spectrogram(s)
 
-            # self.initial_tokens: Tuple[int] = self._get_initial_tokens()
-            self.initial_tokens = self._get_initial_tokens()
+    options: DecodingOptions
+        A dataclass that contains all necessary options for decoding 30-second segments
 
-            # branch to handle batched case
-            self.sample_begin: List[int] = [
-                len(tokens) for tokens in self.initial_tokens
-            ]
-            self.sot_index: List[int] = [
-                tokens.index(self.tokenizers[i].sot)
-                for i, tokens in enumerate(self.initial_tokens)
-            ]
+    Returns
+    -------
+    result: Union[DecodingResult, List[DecodingResult]]
+        The result(s) of decoding contained in `DecodingResult` dataclass instance(s)
+    """
+    if single := mel.ndim == 2:
+        mel = mel.unsqueeze(0)
 
-            # inference: implements the forward pass through the decoder, including kv caching
-            self.inference = PyTorchInference(
-                model, max([len(tokens) for tokens in self.initial_tokens])
-            )
+    if kwargs:
+        options = replace(options, **kwargs)
 
-            # sequence ranker: implements how to rank a group of sampled sequences
-            self.sequence_ranker = MaximumLikelihoodRanker(options.length_penalty)
+    result = EMBDecodingTask(model_wspr, options).run(mel)
 
-            # logit filters: applies various rules to suppress or penalize certain tokens
-            self.decoder = []
-            self.logit_filters = [[]] * len(self.initial_tokens)
-            for i in range(len(self.initial_tokens)):
-                # decoder: implements how to select the next tokens, given the autoregressive distribution
-                if options.beam_size is not None:
-                    self.decoder.append(
-                        BeamSearchDecoder(
-                            options.beam_size,
-                            self.tokenizers[i].eot,
-                            self.inference,
-                            options.patience,
-                        )
-                    )
-                else:
-                    self.decoder.append(
-                        GreedyDecoder(options.temperature, self.tokenizers[i].eot)
-                    )
+    return result[0] if single else result
 
-                if self.options.suppress_blank:
-                    self.logit_filters[i].append(
-                        SuppressBlank(self.tokenizers[i], self.sample_begin[i])
-                    )
-                if self.options.suppress_tokens:
-                    self.logit_filters[i].append(
-                        SuppressTokens(self._get_suppress_tokens(self.tokenizers[i]))
-                    )
-                if not options.without_timestamps:
-                    precision = (
-                        CHUNK_LENGTH / model.dims.n_audio_ctx
-                    )  # usually 0.02 seconds
-                    max_initial_timestamp_index = None
-                    if options.max_initial_timestamp:
-                        max_initial_timestamp_index = round(
-                            self.options.max_initial_timestamp / precision
-                        )
-                    self.logit_filters[i].append(
-                        ApplyTimestampRules(
-                            self.tokenizers[i],
-                            self.sample_begin[i],
-                            max_initial_timestamp_index,
-                        )
-                    )
-        else:
-            if self.options.without_timestamps:
-                self.sot_sequence = tokenizer.sot_sequence_including_notimestamps
-            else:
-                self.sot_sequence: Tuple[int] = tokenizer.sot_sequence
 
-            # self.initial_tokens: Tuple[int] = self._get_initial_tokens()
-            self.initial_tokens = self._get_initial_tokens()
+# Potentially needed for word timestamps (if adapted, currently removed/warned)
+# from .timing import add_word_timestamps, get_end
 
-            self.sample_begin: int = len(self.initial_tokens)
-            self.sot_index: int = self.initial_tokens.index(tokenizer.sot)
-
-            # inference: implements the forward pass through the decoder, including kv caching
-            self.inference = PyTorchInference(model, len(self.initial_tokens))
-
-            # sequence ranker: implements how to rank a group of sampled sequences
-            self.sequence_ranker = MaximumLikelihoodRanker(options.length_penalty)
-
-            # decoder: implements how to select the next tokens, given the autoregressive distribution
-            if options.beam_size is not None:
-                self.decoder = BeamSearchDecoder(
-                    options.beam_size, tokenizer.eot, self.inference, options.patience
-                )
-            else:
-                self.decoder = GreedyDecoder(options.temperature, tokenizer.eot)
-
-            # logit filters: applies various rules to suppress or penalize certain tokens
-            if self.options.suppress_blank:
-                self.logit_filters.append(
-                    SuppressBlank(self.tokenizer, self.sample_begin)
-                )
-            if self.options.suppress_tokens:
-                self.logit_filters.append(
-                    SuppressTokens(self._get_suppress_tokens(self.tokenizer))
-                )
-            if not options.without_timestamps:
-                precision = (
-                    CHUNK_LENGTH / model.dims.n_audio_ctx
-                )  # usually 0.02 seconds
-                max_initial_timestamp_index = None
-                if options.max_initial_timestamp:
-                    max_initial_timestamp_index = round(
-                        self.options.max_initial_timestamp / precision
-                    )
-                self.logit_filters.append(
-                    ApplyTimestampRules(
-                        tokenizer, self.sample_begin, max_initial_timestamp_index
-                    )
-                )
-
-    def _verify_options(self, options: DecodingOptions) -> DecodingOptions:
-        if options.beam_size is not None and options.best_of is not None:
-            raise ValueError("beam_size and best_of can't be given together")
-        if options.temperature == 0:
-            if options.best_of is not None:
-                raise ValueError("best_of with greedy sampling (T=0) is not compatible")
-        if options.patience is not None and options.beam_size is None:
-            raise ValueError("patience requires beam_size to be given")
-        if options.length_penalty is not None and not (
-            0 <= options.length_penalty <= 1
-        ):
-            raise ValueError("length_penalty (alpha) should be a value between 0 and 1")
-
-        return options
-
-    def _get_initial_tokens(self) -> Tuple[int]:
-        tokens = list(self.sot_sequence)
-        prefix = self.options.prefix
-        prompt = self.options.prompt
-        if (len(prompt) >= 1) and isinstance(prompt[0], list):
-            # branch to batched version if prompt is a list of prompts
-            return self._get_batched_initial_tokens()
-
-        if prefix:
-            prefix_tokens = (
-                self.tokenizer.encode(" " + prefix.strip())
-                if isinstance(prefix, str)
-                else prefix
-            )
-            if self.sample_len is not None:
-                max_prefix_len = self.n_ctx // 2 - self.sample_len
-                prefix_tokens = prefix_tokens[-max_prefix_len:]
-            tokens = tokens + prefix_tokens
-
-        if prompt:
-            prompt_tokens = (
-                self.tokenizer.encode(" " + prompt.strip())
-                if isinstance(prompt, str)
-                else prompt
-            )
-            tokens = (
-                [self.tokenizer.sot_prev]
-                + prompt_tokens[-(self.n_ctx // 2 - 1) :]
-                + tokens
-            )
-
-        return tuple(tokens)
-
-    def _get_batched_initial_tokens(self) -> List[Tuple[int]]:
-        tokens = self.sot_sequence
-        prefixes = self.options.prefix
-        if not isinstance(prefixes, list):
-            prefixes = [prefixes] * len(self.options.prompt)
-        prompts = self.options.prompt
-        min_prompt_len = min([len(prompt) for prompt in prompts])
-
-        # res_tokens = [tokens]*len(prompts)
-        res_tokens = tokens
-        for i, (prefix, prompt) in enumerate(list(zip(prefixes, prompts))):
-            if prefix:
-                prefix_tokens = (
-                    self.tokenizers[i].encode(" " + prefix.strip())
-                    if isinstance(prefix, str)
-                    else prefix
-                )
-                if self.sample_len is not None:
-                    max_prefix_len = self.n_ctx // 2 - self.sample_len
-                    prefix_tokens = prefix_tokens[-max_prefix_len:]
-                res_tokens[i] = res_tokens[i] + prefix_tokens
-
-            if prompt:
-                prompt_tokens = (
-                    self.tokenizers[i].encode(" " + prompt.strip())
-                    if isinstance(prompt, str)
-                    else prompt
-                )
-                # truncate longer prompts to the length of the shortest prompt
-                prompt_tokens = prompt_tokens[-min_prompt_len:]
-                res_tokens[i] = (
-                    [self.tokenizers[i].sot_prev]
-                    + prompt_tokens[-(self.n_ctx // 2 - 1) :]
-                    + list(res_tokens[i])
-                )
-        return [tuple(tokens) for tokens in res_tokens]
-
-    def _get_suppress_tokens(self, tokenizer: Tokenizer) -> Tuple[int]:
-        suppress_tokens = self.options.suppress_tokens
-
-        if isinstance(suppress_tokens, str):
-            suppress_tokens = [int(t) for t in suppress_tokens.split(",")]
-
-        if -1 in suppress_tokens:
-            suppress_tokens = [t for t in suppress_tokens if t >= 0]
-            suppress_tokens.extend(tokenizer.non_speech_tokens)
-        elif suppress_tokens is None or len(suppress_tokens) == 0:
-            suppress_tokens = []  # interpret empty string as an empty list
-        else:
-            assert isinstance(suppress_tokens, list), "suppress_tokens must be a list"
-
-        suppress_tokens.extend([tokenizer.sot, tokenizer.sot_prev, tokenizer.sot_lm])
-        if tokenizer.no_speech is not None:
-            # no-speech probability is collected separately
-            suppress_tokens.append(tokenizer.no_speech)
-
-        return tuple(sorted(set(suppress_tokens)))
-
-    def _detect_language(self, audio_features: Tensor, tokens: Tensor):
-        languages = [self.options.language] * audio_features.shape[0]
-        lang_probs = None
-
-        if self.options.language is None or self.options.task == "lang_id":
-            lang_tokens, lang_probs = self.model.detect_language(
-                audio_features, self.tokenizer
-            )
-            languages = [max(probs, key=probs.get) for probs in lang_probs]
-            if self.options.language is None:
-                if isinstance(self.sot_index, list):
-                    for i in range(tokens.shape[0]):
-                        tokens[i, self.sot_index[i] + 1] = lang_tokens[
-                            i
-                        ]  # write language tokens
-                else:
-                    tokens[:, self.sot_index + 1] = lang_tokens  # write language tokens
-
-        return languages, lang_probs
-
-    def _main_loop(self, audio_features: Tensor, tokens: Tensor):
-        assert audio_features.shape[0] == tokens.shape[0]
-        n_batch = tokens.shape[0]
-        sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
-        no_speech_probs = [np.nan] * n_batch
-
-        try:
-            for i in range(self.sample_len):
-                # NOTE: **********Here is the model inference****************
-                logits = self.inference.logits(tokens, audio_features)
-
-                if isinstance(self.sot_index, list):
-                    if i == 0 and not any(
-                        isinstance(tok.no_speech, type(None)) for tok in self.tokenizers
-                    ):  # save no_speech_probs
-                        probs_at_sot = []
-                        no_speech_probs = []
-                        for i in range(len(self.sot_index)):
-                            probs_at_sot.append(
-                                logits[:, self.sot_index[i]].float().softmax(dim=-1)
-                            )
-                            no_speech_probs.append(
-                                probs_at_sot[i][
-                                    :, self.tokenizers[i].no_speech
-                                ].tolist()
-                            )
-                else:
-                    if (
-                        i == 0 and self.tokenizer.no_speech is not None
-                    ):  # save no_speech_probs
-                        probs_at_sot = logits[:, self.sot_index].float().softmax(dim=-1)
-                        no_speech_probs = probs_at_sot[
-                            :, self.tokenizer.no_speech
-                        ].tolist()
-
-                # now we need to consider the logits at the last token only
-                logits = logits[:, -1]
-
-                # apply the logit filters, e.g. for suppressing or applying penalty to
-                if (len(self.logit_filters) > 0) and (
-                    isinstance(self.logit_filters[0], list)
-                ):
-                    # for batched case
-                    for i, logit_filter_group in enumerate(self.logit_filters):
-                        for logit_filter in logit_filter_group:
-                            logit_filter.apply(
-                                logits[i].unsqueeze(0), tokens[i].unsqueeze(0)
-                            )
-                elif len(self.logit_filters) > 0:
-                    for logit_filter in self.logit_filters:
-                        logit_filter.apply(logits, tokens)
-
-                if isinstance(self.decoder, list):
-                    # handle batched case
-                    completed = []
-                    new_tokens = []
-                    for i in range(len(self.decoder)):
-                        # expand the tokens tensor with the selected next tokens
-                        token_slice, comp = self.decoder[i].update(
-                            tokens[i].unsqueeze(0),
-                            logits[i].unsqueeze(0),
-                            sum_logprobs[i].unsqueeze(0),
-                        )
-                        new_tokens.append(token_slice)
-                        completed.append(comp)
-                    tokens = torch.cat(new_tokens, dim=0)
-                else:
-                    # expand the tokens tensor with the selected next tokens
-                    tokens, completed = self.decoder.update(
-                        tokens, logits, sum_logprobs
-                    )
-
-                if isinstance(completed, list):
-                    completed = all(completed)
-                    if completed or tokens.shape[-1] > self.n_ctx:
-                        break
-                else:
-                    if completed or tokens.shape[-1] > self.n_ctx:
-                        break
-        finally:
-            self.inference.cleanup_caching()
-
-        return tokens, sum_logprobs, no_speech_probs
-
-    @torch.no_grad()
-    def run(self, audio_features: Tensor) -> List[DecodingResult]:
-        if isinstance(self.decoder, list):
-            _ = [decoder.reset() for decoder in self.decoder]
-            tokenizer: List[Tokenizer] = self.tokenizers
-        else:
-            self.decoder.reset()
-            tokenizer: Tokenizer = self.tokenizer
-        n_audio: int = audio_features.shape[0]
-
-        if isinstance(self.initial_tokens, list):
-            # if batched, then stack prompts together in batch dimension
-            tokens = [list(token) for token in self.initial_tokens]
-            min_len = min([len(t) for t in tokens])
-            tokens = [t[:min_len] for t in tokens]
-            tokens: Tensor = torch.tensor(tokens)
-        else:
-            tokens: Tensor = torch.tensor([self.initial_tokens]).repeat(n_audio, 1)
-
-        # detect language if requested, overwriting the language token
-        languages, language_probs = self._detect_language(audio_features, tokens)
-
-        if self.options.task == "lang_id":
-            return [
-                DecodingResult(
-                    audio_features=features, language=language, language_probs=probs
-                )
-                for features, language, probs in zip(
-                    audio_features, languages, language_probs
-                )
-            ]
-        # repeat the audio & text tensors by the group size, for beam search or best-of-n sampling
-        audio_features = audio_features.repeat_interleave(self.n_group, dim=0)
-        tokens = tokens.repeat_interleave(self.n_group, dim=0).to(audio_features.device)
-
-        # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
-
-        # reshape the tensors to have (n_audio, n_group) as the first two dimensions
-        audio_features = audio_features[:: self.n_group]
-        no_speech_probs = no_speech_probs[:: self.n_group]
-        assert audio_features.shape[0] == len(no_speech_probs) == n_audio
-
-        tokens = tokens.reshape(n_audio, self.n_group, -1)
-        sum_logprobs = sum_logprobs.reshape(n_audio, self.n_group)
-
-        if isinstance(self.decoder, list):
-            new_tokens = []
-            sum_logprobs_new = []
-            for i in range(len(self.decoder)):
-                # get the final candidates for each group, and slice between the first sampled token and EOT
-                token_slice, sum_logprob_slice = self.decoder[i].finalize(
-                    tokens[i].unsqueeze(0), sum_logprobs[i].unsqueeze(0)
-                )
-                new_tokens.append(token_slice)
-                sum_logprobs_new.append(sum_logprob_slice[0])
-            tokens = torch.cat(new_tokens, dim=0)
-            sum_logprobs = sum_logprobs_new
-        else:
-            # get the final candidates for each group, and slice between the first sampled token and EOT
-            tokens, sum_logprobs = self.decoder.finalize(tokens, sum_logprobs)
-
-        if isinstance(self.sample_begin, list):
-            tokens: List[List[Tensor]] = [
-                [
-                    t[self.sample_begin[i] : (t == tokenizer[i].eot).nonzero()[0, 0]]
-                    for t in s
-                ]
-                for i, s in enumerate(tokens)
-            ]
-        else:
-            tokens: List[List[Tensor]] = [
-                [t[self.sample_begin : (t == tokenizer.eot).nonzero()[0, 0]] for t in s]
-                for s in tokens
-            ]
-
-        # select the top-ranked sample in each group
-        selected = self.sequence_ranker.rank(tokens, sum_logprobs)
-        tokens: List[List[int]] = [t[i].tolist() for i, t in zip(selected, tokens)]
-        if isinstance(tokenizer, list):
-            texts: List[str] = [
-                tokenizer[i].decode(t).strip() for i, t in enumerate(tokens)
-            ]
-        else:
-            texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
-
-        sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
-        avg_logprobs: List[float] = [
-            lp / (len(t) + 1) for t, lp in zip(tokens, sum_logprobs)
-        ]
-
-        fields = (
-            texts,
-            languages,
-            tokens,
-            audio_features,
-            avg_logprobs,
-            no_speech_probs,
-        )
-        if len(set(map(len, fields))) != 1:
-            raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
-
-        return [
-            DecodingResult(
-                audio_features=features,
-                language=language,
-                tokens=tokens,
-                text=text,
-                avg_logprob=avg_logprob,
-                no_speech_prob=no_speech_prob,
-                temperature=self.options.temperature,
-                compression_ratio=compression_ratio(text),
-            )
-            for text, language, tokens, features, avg_logprob, no_speech_prob in zip(
-                *fields
-            )
-        ]
+# Define constants relevant to embeddings
+# The encoder halves the time dimension relative to mel frames
+EMBEDDING_FRAMES_PER_SECOND = FRAMES_PER_SECOND // 2
+# N_FRAMES corresponds to 30 seconds of mel frames
+EMBEDDING_FRAMES_PER_30_SEC = (
+    N_FRAMES // 2
+)  # Usually 1500, same as model.dims.n_audio_ctx
 
 
 def transcribe_embeddings(
-    model: "Whisper",
-    embedding: List[torch.Tensor],
+    model,
+    audio_embeddings: torch.Tensor,  # Expecting shape [TotalEmbeddingFrames, EmbeddingDim] or [1, TotalEmbeddingFrames, EmbeddingDim]
     *,
+    language: str,  # Language is now mandatory
     verbose: Optional[bool] = None,
     temperature: Union[float, Tuple[float, ...]] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
     compression_ratio_threshold: Optional[float] = 2.4,
     logprob_threshold: Optional[float] = -1.0,
     no_speech_threshold: Optional[float] = 0.6,
     condition_on_previous_text: bool = True,
+    initial_prompt: Optional[str] = None,
+    carry_initial_prompt: bool = False,
+    # word_timestamps: bool = False, # Word timestamps are problematic with only embeddings
+    # prepend_punctuations: str = "\"'“¿([{-",
+    # append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+    clip_timestamps: Union[
+        str, List[float]
+    ] = "0",  # In seconds relative to original audio duration
+    # hallucination_silence_threshold: Optional[float] = None,
     **decode_options,
 ):
     """
-    Transcribe multiple audio files in parallel using the batch dimension of the Whisper model
+    Transcribe audio represented by pre-computed Whisper encoder embeddings.
 
     Parameters
     ----------
     model: Whisper
-        The Whisper model instance
+        The Whisper model instance.
 
-    audio: Union[List[str], List[np.ndarray], List[torch.Tensor]]
-        The list of paths to the audio files to open, or the audio waveforms
+    audio_embeddings: torch.Tensor
+        The pre-computed audio embeddings from the Whisper encoder.
+        Expected shape: [N_total_embedding_frames, N_embedding_dims] or [1, N_total_embedding_frames, N_embedding_dims].
 
-    verbose: bool
-        Whether to display the text being decoded to the console. If True, displays all the details,
-        If False, displays minimal details. If None, does not display anything
+    language: str
+        The language spoken in the audio. This MUST be specified.
 
-    temperature: Union[float, Tuple[float, ...]]
-        Temperature for sampling. It can be a tuple of temperatures, which will be successfully used
-        upon failures according to either `compression_ratio_threshold` or `logprob_threshold`.
-
-    compression_ratio_threshold: float
-        If the gzip compression ratio is above this value, treat as failed
-
-    logprob_threshold: float
-        If the average log probability over sampled tokens is below this value, treat as failed
-
-    no_speech_threshold: float
-        If the no_speech probability is higher than this value AND the average log probability
-        over sampled tokens is below `logprob_threshold`, consider the segment as silent
-
-    condition_on_previous_text: bool
-        if True, the previous output of the model is provided as a prompt for the next window;
-        disabling may make the text inconsistent across windows, but the model becomes less prone to
-        getting stuck in a failure loop, such as repetition looping or timestamps going out of sync.
-
-    decode_options: dict
-        Keyword arguments to construct `DecodingOptions` instances
+    verbose: bool, temperature, ..., **decode_options:
+        See the original `transcribe` function documentation.
+        Note: `word_timestamps` and related options are currently disabled/ignored
+              as they rely on Mel spectrograms for reliable alignment.
 
     Returns
     -------
-    A list of dictionaries containing the resulting text ("text") and segment-level details ("segments"), and
-    the spoken language ("language"), which is detected when `decode_options["language"]` is None.
+    A dictionary containing the resulting text ("text") and segment-level details ("segments"), and
+    the spoken language ("language").
     """
-    batch_size = embedding.shape[0]
 
-    segments = [emb for emb in embedding]
+    # --- Input Validation and Setup ---
+    if language is None:
+        raise ValueError(
+            "The 'language' parameter must be specified when using transcribe_embeddings."
+        )
+    decode_options["language"] = language  # Ensure language is in decode_options
 
-    dtype = torch.float16 if decode_options.get("fp16", True) else torch.float32
+    if audio_embeddings.ndim == 2:
+        audio_embeddings = audio_embeddings.unsqueeze(0)  # Add batch dimension
+    elif audio_embeddings.ndim != 3:
+        raise ValueError(
+            f"Expected audio_embeddings with shape [1, N, D] or [N, D], got {audio_embeddings.shape}"
+        )
+
+    # Squeeze batch dim if it's 1 for easier slicing later? Or keep it? Keep it for consistency with mel.
+    # audio_embeddings = audio_embeddings.squeeze(0) # Let's keep batch dim [1, N, D]
+
+    n_batch, total_embedding_frames, n_dims = audio_embeddings.shape
+    if n_batch != 1:
+        warnings.warn(
+            f"Processing embeddings with batch size {n_batch}. Only batch size 1 is fully tested for transcribe_embeddings."
+        )
+
+    # Check embedding dimension matches model
+    expected_dims = model.dims.n_audio_state
+    if n_dims != expected_dims:
+        raise ValueError(
+            f"Embedding dimension ({n_dims}) does not match model's expected audio state dimension ({expected_dims})"
+        )
+
+    device = audio_embeddings.device
+    dtype = audio_embeddings.dtype  # Use the dtype of the provided embeddings
+
+    # Warn if using CPU/FP16 (though embeddings might already be computed optimally)
     if model.device == torch.device("cpu"):
         if torch.cuda.is_available():
             warnings.warn("Performing inference on CPU when CUDA is available")
         if dtype == torch.float16:
-            warnings.warn("FP16 is not supported on CPU; using FP32 instead")
-            dtype = torch.float32
+            # This check might be less relevant if embeddings are pre-computed
+            warnings.warn("Using FP16 embeddings on CPU.")
+            # Don't change dtype here, use the provided one.
 
-    if dtype == torch.float32:
-        decode_options["fp16"] = False
+    # Set fp16 option based on embedding dtype for decode options
+    decode_options["fp16"] = dtype == torch.float16
 
-    if decode_options.get("language", None) is None:
-        if not model.is_multilingual:
-            languages = ["en"] * batch_size
-        else:
-            # if verbose:
-            #     print("Detecting language using up to the first 30 seconds. Use `--language` to specify the language")
-            # language_probs = [model.detect_language(segment)[1] for segment in segments]
-            # languages = [max(probs, key=probs.get) for probs in language_probs]
-            # if verbose is not None:
-            #     print(f"Detected languages: {[LANGUAGES[opt].title() for opt in languages]}")
-            raise ValueError("Detecting language is not supported for embs")
-    else:
-        lang = decode_options.get("language")
-        if isinstance(lang, str):
-            languages = [lang] * batch_size
-        elif isinstance(lang, list):
-            assert all(isinstance(lan, str) for lan in lang), (
-                "If a list of languages is specified in DecodeOptions, all languages must be strings."
-            )
-            assert len(lang) == batch_size, (
-                "If a list of languages is specified in DecodeOptions, the list length must match the number of audio files specified."
-            )
-            languages = lang
-        else:
-            raise NotImplementedError(
-                "Only string and list arguments are supported for the language DecodeOption."
-            )
+    # Calculate total duration based on embeddings
+    # Each embedding frame corresponds to input_stride * HOP_LENGTH / SAMPLE_RATE seconds
+    # input_stride = exact_div(N_FRAMES, model.dims.n_audio_ctx) -> Typically 2
+    time_per_embedding_frame = (HOP_LENGTH / SAMPLE_RATE) * 2  # Usually 0.02 seconds
 
-    task = decode_options.get("task", "transcribe")
-    tokenizers = {}
-    for lang in languages:
-        if lang not in tokenizers.keys():
-            tokenizers[lang] = get_tokenizer(
-                model.is_multilingual, language=lang, task=task
-            )
+    # --- Language/Tokenizer Setup (Simplified) ---
+    # Language is mandatory, no detection needed here.
+    task: str = decode_options.get("task", "transcribe")
+    tokenizer = get_tokenizer(
+        model.is_multilingual,
+        num_languages=model.num_languages,
+        language=language,
+        task=task,
+    )
 
-    def decode_with_fallback(segment: torch.Tensor) -> DecodingResult:
+    # --- Clipping Timestamps (Converted to Embedding Frames) ---
+    if isinstance(clip_timestamps, str):
+        clip_timestamps = [
+            float(ts) for ts in (clip_timestamps.split(",") if clip_timestamps else [])
+        ]
+    # Convert clip timestamps (seconds) to embedding frame indices
+    seek_points_emb: List[int] = [
+        round(ts / time_per_embedding_frame) for ts in clip_timestamps
+    ]
+
+    if len(seek_points_emb) == 0:
+        seek_points_emb.append(0)
+    if len(seek_points_emb) % 2 == 1:
+        seek_points_emb.append(total_embedding_frames)
+    # Ensure points are within bounds
+    seek_points_emb = [min(max(0, p), total_embedding_frames) for p in seek_points_emb]
+
+    seek_clips_emb: List[Tuple[int, int]] = list(
+        zip(seek_points_emb[::2], seek_points_emb[1::2])
+    )
+
+    # --- Word Timestamp Warning ---
+    if decode_options.get("word_timestamps", False):
+        warnings.warn(
+            "Word timestamps are experimental and may be unreliable when using pre-computed embeddings. Disabling."
+        )
+        decode_options["word_timestamps"] = False  # Force disable
+
+    # --- Decoding Fallback Logic (Adapted for Embeddings) ---
+    def decode_with_fallback_embeddings(
+        segment_embeddings: torch.Tensor,
+    ) -> DecodingResult:
         temperatures = (
             [temperature] if isinstance(temperature, (int, float)) else temperature
         )
         decode_result = None
+
+        # Ensure segment has batch dimension
+        if segment_embeddings.ndim == 2:
+            segment_embeddings = segment_embeddings.unsqueeze(0)
+
+        # Pad or trim the embedding segment to the expected context length (N_CTX)
+        # N_CTX is typically EMBEDDING_FRAMES_PER_30_SEC (1500)
+        n_ctx = model.dims.n_audio_ctx
+        current_len = segment_embeddings.shape[1]
+
+        if current_len < n_ctx:
+            padding = n_ctx - current_len
+            # Pad with zeros? Or replicate last frame? Zeros seems safer.
+            segment_embeddings = torch.nn.functional.pad(
+                segment_embeddings,
+                (0, 0, 0, padding),  # Pad last dim (time/ctx)
+            )
+        elif current_len > n_ctx:
+            segment_embeddings = segment_embeddings[:, :n_ctx, :]
+
         for t in temperatures:
             kwargs = {**decode_options}
             if t > 0:
-                # disable beam_size and patience when t > 0
                 kwargs.pop("beam_size", None)
                 kwargs.pop("patience", None)
             else:
-                # disable best_of when t == 0
                 kwargs.pop("best_of", None)
 
             options = DecodingOptions(**kwargs, temperature=t)
-            decode_result = EmbDecodingTask(model, options).run(segment)
+            # *** Call the new decode_embeddings function ***
+            decode_result = decode_embeddings(
+                model, segment_embeddings, options
+            )  # Pass embedding segment
 
+            # Fallback logic remains the same
             needs_fallback = False
-            if isinstance(decode_result, list):
-                for dr in decode_result:
-                    if (
-                        compression_ratio_threshold is not None
-                        and dr.compression_ratio > compression_ratio_threshold
-                    ):
-                        needs_fallback = True  # too repetitive
-                    if (
-                        logprob_threshold is not None
-                        and dr.avg_logprob < logprob_threshold
-                    ):
-                        needs_fallback = True  # average log probability is too low
-            else:
-                if (
-                    compression_ratio_threshold is not None
-                    and decode_result.compression_ratio > compression_ratio_threshold
-                ):
-                    needs_fallback = True  # too repetitive
-                if (
-                    logprob_threshold is not None
-                    and decode_result.avg_logprob < logprob_threshold
-                ):
-                    needs_fallback = True  # average log probability is too low
+            decode_result = decode_result[0]
+            if (
+                compression_ratio_threshold is not None
+                and decode_result.compression_ratio > compression_ratio_threshold
+            ):
+                needs_fallback = True
+            if (
+                logprob_threshold is not None
+                and decode_result.avg_logprob < logprob_threshold
+            ):
+                needs_fallback = True
+            if (
+                no_speech_threshold is not None
+                and decode_result.no_speech_prob > no_speech_threshold
+                and logprob_threshold is not None
+                and decode_result.avg_logprob < logprob_threshold
+            ):
+                # Check if this segment is potentially silent despite the logprob.
+                # This might be less reliable without the direct encoder run,
+                # but we keep the logic for consistency.
+                needs_fallback = False  # Considered silence
 
             if not needs_fallback:
                 break
 
         return decode_result
 
-    seekers = [0] * batch_size
-    input_stride = exact_div(
-        N_FRAMES, model.dims.n_audio_ctx
-    )  # mel frames per output token: 2
-    time_precision = (
-        HOP_LENGTH / SAMPLE_RATE
-    ) * 2  # time per output token: 0.02 (seconds)
-    all_tokens = [[] for _ in range(batch_size)]
-    all_segments = [[] for _ in range(batch_size)]
-    prompt_reset_since = [0] * batch_size
+    # --- Main Transcription Loop (Iterating over Embeddings) ---
+    clip_idx = 0
+    seek = seek_clips_emb[clip_idx][0]  # seek is now in embedding frame indices
+    time_precision = time_per_embedding_frame  # time per output token: 0.02 (seconds)
 
-    initial_prompt = decode_options.pop("initial_prompt", None) or []
-    initial_prompts = []
-    if initial_prompt:
-        assert len(initial_prompt) == batch_size, (
-            "Number of initial prompts must match batch size."
-        )
-        for i in range(batch_size):
-            initial_prompts.append(
-                tokenizers[languages[i]].encode(" " + initial_prompt[i].strip())
-            )
-            all_tokens.extend(initial_prompt)
+    all_tokens = []
+    all_segments = []
+    prompt_reset_since = 0
 
-    def add_segment(
+    remaining_prompt_length = model.dims.n_text_ctx // 2 - 1
+    if initial_prompt is not None:
+        initial_prompt_tokens = tokenizer.encode(" " + initial_prompt.strip())
+        all_tokens.extend(initial_prompt_tokens)
+        remaining_prompt_length -= len(initial_prompt_tokens)
+    else:
+        initial_prompt_tokens = []
+
+    def new_segment(
         *,
-        seeker: int,
-        segments: list,
+        current_seek: int,
         start: float,
         end: float,
-        text_tokens: torch.Tensor,
+        tokens: torch.Tensor,
         result: DecodingResult,
-        tokenizer,
     ):
-        text = tokenizer.decode(
-            [token for token in text_tokens if token < tokenizer.eot]
-        )
-        if len(text.strip()) == 0:  # skip empty text output
-            return
+        # `seek` in the returned segment should arguably be the original audio seek point
+        # or maybe the embedding seek point. Let's use embedding seek point for now.
+        tokens = tokens.tolist()
+        text_tokens = [token for token in tokens if token < tokenizer.eot]
+        return {
+            "seek": current_seek,  # The starting *embedding frame index* of this chunk
+            "start": start,  # Start time in seconds
+            "end": end,  # End time in seconds
+            "text": tokenizer.decode(text_tokens),
+            "tokens": tokens,
+            "temperature": result.temperature,
+            "avg_logprob": result.avg_logprob,
+            "compression_ratio": result.compression_ratio,
+            "no_speech_prob": result.no_speech_prob,
+        }
 
-        segments.append(
-            {
-                "id": len(segments),
-                "seek": seeker,
-                "start": start,
-                "end": end,
-                "text": text,
-                "tokens": text_tokens.tolist(),
-                "temperature": result.temperature,
-                "avg_logprob": result.avg_logprob,
-                "compression_ratio": result.compression_ratio,
-                "no_speech_prob": result.no_speech_prob,
-            }
-        )
-        if verbose:
-            print(f"[{format_timestamp(start)} --> {format_timestamp(end)}] {text}")
-
-    # show the progress bar when verbose is False (otherwise the transcribed text will be printed)
-    num_frames = [embedding.shape[1] for i in range(batch_size)]
-    previous_seek_values = copy.deepcopy(seekers)
-
-    def check_cursors(seekers: List[int], num_frames: List[int]) -> bool:
-        """Return False when all seekers have exhausted the length of their audio clips."""
-        return any([seeker < nf for seeker, nf in list(zip(seekers, num_frames))])
-
+    # Show the progress bar based on embedding frames
     with tqdm.tqdm(
-        total=max(num_frames), unit="frames", disable=verbose is not False
+        total=total_embedding_frames, unit="frames", disable=verbose is not False
     ) as pbar:
-        while check_cursors(seekers, num_frames):
-            continue_processing = [
-                seeker < nf for seeker, nf in list(zip(seekers, num_frames))
-            ]
-            # Only those segments for clips that are not done being processed
-            imap = [i for i, v in enumerate(continue_processing) if v]
-            batch_segments = []
-            batch_segment_durations = []
-            batch_timestamp_offsets = []
-            for i, emb in enumerate(embedding):
-                if continue_processing[i]:
-                    timestamp_offset = float(seekers[i] * HOP_LENGTH / SAMPLE_RATE)
-                    batch_timestamp_offsets.append(timestamp_offset)
-                    segment = emb  # assume we want the whole embedding
-                    segment_duration = 30  # assume embedding is full 30s
-                    batch_segments.append(segment)
-                    batch_segment_durations.append(segment_duration)
-                else:
-                    continue
+        # last_speech_timestamp = 0.0 # Not used if word timestamps disabled
 
-            decode_options["prompt"] = [
-                all_tokens[imap[i]][prompt_reset_since[imap[i]] :]
-                for i in range(len(batch_segments))
-            ]
-            decode_options["language"] = [
-                lan for i, lan in enumerate(languages) if continue_processing[i]
-            ]
-            results: List[DecodingResult] = decode_with_fallback(
-                torch.stack(batch_segments)
+        while clip_idx < len(seek_clips_emb):
+            seek_clip_start, seek_clip_end = seek_clips_emb[clip_idx]
+            if seek < seek_clip_start:
+                seek = seek_clip_start
+            if seek >= seek_clip_end:
+                clip_idx += 1
+                if clip_idx < len(seek_clips_emb):
+                    seek = seek_clips_emb[clip_idx][0]
+                continue
+
+            # Calculate time offset based on embedding frame seek position
+            time_offset = float(seek * time_precision)
+            # window_end_time = float((seek + EMBEDDING_FRAMES_PER_30_SEC) * time_precision) # Not strictly needed?
+
+            # Determine the size of the current embedding segment to process
+            segment_size_emb = min(
+                EMBEDDING_FRAMES_PER_30_SEC,
+                total_embedding_frames - seek,
+                seek_clip_end - seek,
             )
-            batch_tokens = [torch.tensor(result.tokens) for result in results]
+            if (
+                segment_size_emb <= 0
+            ):  # Should not happen with proper clip logic, but check
+                break
 
-            no_speech_results = [False] * len(results)
+            # Slice the embedding tensor [batch, time, dim]
+            embedding_segment = audio_embeddings[:, seek : seek + segment_size_emb, :]
+            segment_duration = segment_size_emb * time_precision  # Duration in seconds
+
+            # --- Prompt Handling ---
+            if carry_initial_prompt:
+                nignored = max(len(initial_prompt_tokens), prompt_reset_since)
+                remaining_prompt = all_tokens[nignored:][-remaining_prompt_length:]
+                decode_options["prompt"] = initial_prompt_tokens + remaining_prompt
+            else:
+                decode_options["prompt"] = all_tokens[prompt_reset_since:]
+
+            # --- Decode the Embedding Segment ---
+            # Note: padding/trimming happens inside decode_with_fallback_embeddings
+            result: DecodingResult = decode_with_fallback_embeddings(embedding_segment)
+            tokens = torch.tensor(
+                result.tokens, device=device
+            )  # Put tokens back on device maybe?
+
+            # --- No Speech Check ---
             if no_speech_threshold is not None:
-                for i, result in enumerate(results):
-                    # no voice activity check
-                    should_skip = result.no_speech_prob[i] > no_speech_threshold
-                    if (
-                        logprob_threshold is not None
-                        and result.avg_logprob > logprob_threshold
-                    ):
-                        # don't skip if the logprob is high enough, despite the no_speech_prob
-                        should_skip = False
-
-                    if should_skip:
-                        seekers[imap[i]] += segment.shape[
-                            -1
-                        ]  # fast-forward to the next segment boundary
-                        no_speech_results[i] = True
-
-            batch_timestamp_tokens: List[torch.Tensor] = [
-                tokens.ge(tokenizers[languages[imap[i]]].timestamp_begin)
-                for i, tokens in enumerate(batch_tokens)
-            ]
-            batch_consecutive = [
-                torch.where(timestamp_tokens[:-1] & timestamp_tokens[1:])[0].add_(1)
-                for timestamp_tokens in batch_timestamp_tokens
-            ]
-
-            for i, consecutive in enumerate(batch_consecutive):
-                if no_speech_results[i]:
-                    continue
+                should_skip = result.no_speech_prob > no_speech_threshold
                 if (
-                    len(consecutive) > 0
-                ):  # if the output contains two consecutive timestamp tokens
-                    last_slice = 0
-                    for current_slice in consecutive:
-                        sliced_tokens = batch_tokens[i][last_slice:current_slice]
-                        start_timestamp_position = (
-                            sliced_tokens[0].item()
-                            - tokenizers[languages[imap[i]]].timestamp_begin
-                        )
-                        end_timestamp_position = (
-                            sliced_tokens[-1].item()
-                            - tokenizers[languages[imap[i]]].timestamp_begin
-                        )
-                        add_segment(
-                            seeker=seekers[imap[i]],
-                            segments=all_segments[imap[i]],
-                            start=batch_timestamp_offsets[i]
-                            + start_timestamp_position * time_precision,
-                            end=batch_timestamp_offsets[i]
-                            + end_timestamp_position * time_precision,
-                            text_tokens=sliced_tokens[1:-1],
-                            result=results[i],
-                            tokenizer=tokenizers[languages[imap[i]]],
-                        )
-                        last_slice = current_slice
-                    last_timestamp_position = (
-                        batch_tokens[i][last_slice - 1].item()
-                        - tokenizers[languages[imap[i]]].timestamp_begin
+                    logprob_threshold is not None
+                    and result.avg_logprob > logprob_threshold
+                ):
+                    should_skip = False
+
+                if should_skip:
+                    seek += (
+                        segment_size_emb  # Fast-forward to the next segment boundary
                     )
-                    seekers[imap[i]] += last_timestamp_position * input_stride
-                    all_tokens[imap[i]].extend(
-                        batch_tokens[i][: last_slice + 1].tolist()
+                    pbar.update(segment_size_emb)  # Update progress for skipped segment
+                    continue  # Skip processing this segment
+
+            # --- Process Tokens and Timestamps ---
+            previous_seek = seek
+            current_segments = []
+
+            timestamp_tokens: torch.Tensor = tokens.ge(tokenizer.timestamp_begin)
+            single_timestamp_ending = timestamp_tokens[-2:].tolist() == [False, True]
+
+            consecutive = torch.where(timestamp_tokens[:-1] & timestamp_tokens[1:])[0]
+            consecutive.add_(1)
+
+            if len(consecutive) > 0:
+                # Output contains multiple consecutive timestamps
+                slices = consecutive.tolist()
+                if single_timestamp_ending:
+                    slices.append(len(tokens))
+
+                last_slice = 0
+                for current_slice in slices:
+                    sliced_tokens = tokens[last_slice:current_slice]
+                    start_timestamp_pos = (
+                        sliced_tokens[0].item() - tokenizer.timestamp_begin
                     )
+                    end_timestamp_pos = (
+                        sliced_tokens[-1].item() - tokenizer.timestamp_begin
+                    )
+                    current_segments.append(
+                        new_segment(
+                            current_seek=seek,  # Pass the start seek of the chunk
+                            start=time_offset + start_timestamp_pos * time_precision,
+                            end=time_offset + end_timestamp_pos * time_precision,
+                            tokens=sliced_tokens,
+                            result=result,
+                        )
+                    )
+                    last_slice = current_slice
+
+                if single_timestamp_ending:
+                    # No speech after the last timestamp. Advance seek by the full segment.
+                    seek += segment_size_emb
                 else:
-                    duration = batch_segment_durations[i]
-                    timestamps = batch_tokens[i][
-                        batch_timestamp_tokens[i].nonzero().flatten()
-                    ]
-                    if (
-                        len(timestamps) > 0
-                        and timestamps[-1].item()
-                        != tokenizers[languages[imap[i]]].timestamp_begin
-                    ):
-                        # no consecutive timestamps but it has a timestamp; use the last one.
-                        # single timestamp at the end means no speech after the last timestamp.
-                        last_timestamp_position = (
-                            timestamps[-1].item()
-                            - tokenizers[languages[imap[i]]].timestamp_begin
-                        )
-                        duration = last_timestamp_position * time_precision
-
-                    add_segment(
-                        seeker=seekers[imap[i]],
-                        segments=all_segments[imap[i]],
-                        start=batch_timestamp_offsets[i],
-                        end=batch_timestamp_offsets[i] + duration,
-                        text_tokens=batch_tokens[i],
-                        result=results[i],
-                        tokenizer=tokenizers[languages[imap[i]]],
+                    # Ignore the unfinished segment and seek to the last timestamp predicted
+                    last_timestamp_pos = (
+                        tokens[last_slice - 1].item() - tokenizer.timestamp_begin
                     )
+                    # Seek is advanced by the number of *embedding frames* corresponding to the timestamp
+                    seek += round(
+                        last_timestamp_pos * time_precision / time_per_embedding_frame
+                    )
+                    # Ensure seek doesn't go backwards or stay static if timestamp is 0
+                    seek = max(seek, previous_seek + 1)
 
-                    seekers[imap[i]] += segments[imap[i]].shape[-1]
-                    all_tokens[imap[i]].extend(batch_tokens[i].tolist())
+            else:
+                # No consecutive timestamps. Treat as a single segment.
+                duration = segment_duration
+                timestamps = tokens[timestamp_tokens.nonzero().flatten()]
+                if (
+                    len(timestamps) > 0
+                    and timestamps[-1].item()
+                    >= tokenizer.timestamp_begin  # Check it's a valid timestamp token
+                ):
+                    # Use the last predicted timestamp if available
+                    last_timestamp_pos = (
+                        timestamps[-1].item() - tokenizer.timestamp_begin
+                    )
+                    duration = last_timestamp_pos * time_precision
 
-                if not condition_on_previous_text or results[i].temperature > 0.5:
-                    # do not feed the prompt tokens if a high temperature was used
-                    prompt_reset_since[imap[i]] = len(all_tokens[imap[i]])
+                current_segments.append(
+                    new_segment(
+                        current_seek=seek,
+                        start=time_offset,
+                        end=time_offset + duration,
+                        tokens=tokens,
+                        result=result,
+                    )
+                )
+                # Advance seek by the full segment size
+                seek += segment_size_emb
 
-            # update progress bar
-            midx = num_frames.index(max(num_frames))
-            pbar.update(
-                min(num_frames[midx], seekers[midx]) - previous_seek_values[midx]
-            )
-            previous_seek_values = copy.deepcopy(seekers)
+            # --- Word Timestamp Logic (Removed/Disabled) ---
+            # if word_timestamps:
+            #    warnings.warn("Word timestamps skipped as they are not supported for embeddings.")
+            # Hallucination logic based on word timestamps also removed
 
-    return [
-        dict(
-            text=tokenizers[languages[i]].decode(
+            if verbose:
+                for segment in current_segments:
+                    start, end, text = segment["start"], segment["end"], segment["text"]
+                    line = f"[{format_timestamp(start)} --> {format_timestamp(end)}] {text}"
+                    print(make_safe(line))
+
+            # Clean up empty segments
+            for i, segment in enumerate(current_segments):
+                if segment["start"] >= segment["end"] or segment["text"].strip() == "":
+                    segment["text"] = ""
+                    segment["tokens"] = []
+                    # segment["words"] = [] # No words key if word timestamps disabled
+
+            all_segments.extend(
                 [
-                    token
-                    for token in all_tokens[i][len(initial_prompt) :]
-                    if token < tokenizers[languages[i]].eot
+                    {"id": i, **segment}
+                    for i, segment in enumerate(
+                        current_segments, start=len(all_segments)
+                    )
+                    if segment["text"]  # Only add segments with actual text
                 ]
-            ),
-            segments=all_segments[i],
-            language=languages[i],
-        )
-        for i in range(len(all_segments))
-    ]
+            )
+            all_tokens.extend(
+                [token for segment in current_segments for token in segment["tokens"]]
+            )
+
+            if not condition_on_previous_text or result.temperature > 0.5:
+                prompt_reset_since = len(all_tokens)
+
+            # Update progress bar: seek might jump, calculate actual advancement
+            pbar.update(max(0, seek - previous_seek))
+
+    # --- Final Output ---
+    return dict(
+        text=tokenizer.decode(all_tokens[len(initial_prompt_tokens) :]),
+        segments=all_segments,
+        language=language,
+    )
