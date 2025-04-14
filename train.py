@@ -1,12 +1,15 @@
 import sys
 
 import torch
+from torchcfm.optimal_transport import wasserstein
 from hyperpyyaml import load_hyperpyyaml
 from data_prepare import prepare_data
 
 import speechbrain as sb
 import whisper
 from torchdyn.core import NeuralODE
+
+from utils_wspr import transcribe_embeddings
 
 
 # Brain class for speech enhancement training
@@ -68,13 +71,23 @@ class SEBrain(sb.Brain):
             targets=predictions["ut"],
         )
 
-        self.inference(batch)
-
         # Some evaluations are slower, and we only want to perform them
         # on the validation set.
-        if stage != sb.Stage.TRAIN:
-            print(self.loss_metric.summarize())
-            print("calc wer")
+        if stage != sb.Stage.TRAIN and self.epoch % self.hparams.validate_every == 0:
+            txt_hyp, p1_pred_batch = self.inference(batch)
+            self.p1_pred.append(p1_pred_batch)
+            self.q1.append(batch.emb_clean)
+
+            self.wer_stats.append(
+                ids=batch.id,
+                predict=[self.hparams.text_normalizer(txt) for txt in txt_hyp],
+                target=[self.hparams.text_normalizer(txt) for txt in batch.txt_label],
+            )
+            self.cer_stats.append(
+                ids=batch.id,
+                predict=[self.hparams.text_normalizer(txt) for txt in txt_hyp],
+                target=[self.hparams.text_normalizer(txt) for txt in batch.txt_label],
+            )
 
         return cfm_loss
 
@@ -95,12 +108,13 @@ class SEBrain(sb.Brain):
                 (predictions - targets) ** 2
             )[None]
         )
-        self.whisper_model = whisper.load_model(
-            self.hparams.whisper_model, device=self.device, download_root="./.cache"
-        )
+
+        self.epoch = epoch
 
         # Set up evaluation-only statistics trackers
-        if stage != sb.Stage.TRAIN:
+        if stage != sb.Stage.TRAIN and epoch % self.hparams.validate_every == 0:
+            self.p1_pred = []
+            self.q1 = []
             self.wer_stats = sb.utils.metric_stats.ErrorRateStats()
             self.cer_stats = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
             self.whisper_model = whisper.load_model(
@@ -126,11 +140,26 @@ class SEBrain(sb.Brain):
 
         # Summarize the statistics from the stage for record-keeping.
         else:
-            stats = {
-                "loss": stage_loss,
-                "wer": self.wer_stats.summarize("WER"),
-                "cer": self.cer_stats.summarize("WER"),
-            }
+            if epoch % self.hparams.validate_every == 0:
+                ot_cost = wasserstein(
+                    torch.concatenate(self.p1_pred), torch.concatenate(self.q1)
+                )
+                print(ot_cost)
+                stats = {
+                    "loss": stage_loss,
+                    "wer": self.wer_stats.summarize("WER"),
+                    "cer": self.cer_stats.summarize("WER"),
+                }
+
+                self.whisper_model = self.whisper_model.cpu()
+                del self.whisper_model
+                del self.p1_pred
+                del self.q1
+
+            else:
+                stats = {
+                    "loss": stage_loss,
+                }
 
         # At the end of validation, we can write stats and checkpoints
         if stage == sb.Stage.VALID:
@@ -143,9 +172,7 @@ class SEBrain(sb.Brain):
 
             # Save the current checkpoint and delete previous checkpoints,
             # unless they have the current best STOI score.
-            self.checkpointer.save_and_keep_only(meta=stats, max_keys=["stoi"])
-
-            del self.whisper_model
+            self.checkpointer.save_and_keep_only(meta=stats, min_keys=["wer"])
 
         # We also write statistics about test data to stdout and to the logfile.
         if stage == sb.Stage.TEST:
@@ -162,21 +189,18 @@ class SEBrain(sb.Brain):
             model_out, _ = self.modules.model(x)
             return model_out
 
-        node = NeuralODE(
-            vt, solver="dopri5", sensitivity="adjoint", atol=1e-4, rtol=1e-4
-        )
-        traj = node.trajectory(emb_noisy, t_span=torch.linspace(0, 1, 100))
+        node = NeuralODE(vt, solver="euler", sensitivity="adjoint")
+        traj = node.trajectory(emb_noisy, t_span=torch.linspace(0, 1, 50))
 
-        emb_clean_pred = traj[-1]
+        results = []
+        for emb_clean_pred in traj[-1]:
+            wspr_result = transcribe_embeddings(
+                self.whisper_model, emb_clean_pred, language="en"
+            )
 
-        from utils_wspr import transcribe_embeddings
+            results.append(wspr_result["text"])
 
-        wspr_result = transcribe_embeddings(
-            self.whisper_model, emb_clean_pred, language="en", verbose=True
-        )
-
-        print(wspr_result)
-        breakpoint()
+        return results, traj[-1]
 
 
 def dataio_prep(hparams):

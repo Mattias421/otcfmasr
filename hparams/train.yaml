@@ -8,7 +8,7 @@
 # #################################
 
 # Seed needs to be set at top of yaml, before objects with parameters are made
-seed: 4234
+seed: 4235
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 
 # Set up folders for reading from and writing to
@@ -22,7 +22,8 @@ __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 # Reading data from the local disk of the compute node (e.g. $SLURM_TMPDIR with SLURM-based clusters) is very important.
 # It allows you to read the data much faster without slowing down the shared filesystem.
 data_folder: ./data
-output_folder: !ref ./results/<seed>
+xp_name: default
+output_folder: !ref ./results/<xp_name>
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
@@ -33,15 +34,17 @@ valid_annotation: !ref <save_folder>/valid.json
 test_annotation: !ref <save_folder>/test.json
 skip_prep: False
 
-# Data for augmentation
-data_folder_noise: !ref <data_folder>/noise # The noisy sequences for data augmentation will automatically be downloaded here.
-NOISE_DATASET_URL: https://www.dropbox.com/scl/fi/a09pj97s5ifan81dqhi4n/noises.zip?rlkey=j8b0n9kdjdr32o1f06t0cw5b7&dl=1
-noise_annotation: noise.csv #The data manifest files are created by the data preparation script
-
+validate_every: 10
 
 # The train logger writes training statistics to a file, as well as stdout.
-train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
-    save_file: !ref <train_log>
+train_logger: !new:speechbrain.utils.train_logger.WandBLogger
+    initializer: !name:wandb.init
+        name: !ref <xp_name>
+        project: otcfmasr
+        dir: !ref <output_folder>/wandb
+        config:
+          batch_size: !ref <batch_size>
+          learning_rate: !ref <learning_rate>
 
 # whisper settings
 text_normalizer: !new:whisper.normalizers.EnglishTextNormalizer
@@ -55,7 +58,7 @@ flow_matcher: !new:torchcfm.conditional_flow_matching.ConditionalFlowMatcher
 
 # Training Parameters
 number_of_epochs: 20
-batch_size: 8
+batch_size: 64
 learning_rate: 0.0001
 num_workers: 4
 dataloader_options:
@@ -63,16 +66,15 @@ dataloader_options:
     num_workers: !ref <num_workers>
 
 
-
-
 # To design a custom model, either just edit the simple CustomModel
 # class that's listed here, or replace this `!new` call with a line
 # pointing to a different file you've defined.
 model: !new:speechbrain.lobes.models.transformer.Transformer.TransformerEncoder
-    num_layers: 1
-    nhead: 8
-    d_ffn: 384
+    num_layers: 4
+    nhead: 6
+    d_ffn: 1536
     d_model: 384
+    attention_type: RoPEMHA
 
 # metrics
 wer_stats: !new:speechbrain.utils.metric_stats.ErrorRateStats
