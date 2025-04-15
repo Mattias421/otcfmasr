@@ -8,7 +8,7 @@
 # #################################
 
 # Seed needs to be set at top of yaml, before objects with parameters are made
-seed: 4235
+seed: 4234
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 
 # Set up folders for reading from and writing to
@@ -66,15 +66,15 @@ dataloader_options:
     num_workers: !ref <num_workers>
 
 
-# To design a custom model, either just edit the simple CustomModel
-# class that's listed here, or replace this `!new` call with a line
-# pointing to a different file you've defined.
+# Model
 model: !new:speechbrain.lobes.models.transformer.Transformer.TransformerEncoder
     num_layers: 4
     nhead: 6
     d_ffn: 1536
     d_model: 384
     attention_type: RoPEMHA
+    activation: !name:torch.nn.GELU
+    dropout: 0.05
 
 # metrics
 wer_stats: !new:speechbrain.utils.metric_stats.ErrorRateStats

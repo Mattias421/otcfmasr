@@ -1,7 +1,6 @@
 import sys
 
 import torch
-from torchcfm.optimal_transport import wasserstein
 from hyperpyyaml import load_hyperpyyaml
 from data_prepare import prepare_data
 
@@ -75,8 +74,12 @@ class SEBrain(sb.Brain):
         # on the validation set.
         if stage != sb.Stage.TRAIN and self.epoch % self.hparams.validate_every == 0:
             txt_hyp, p1_pred_batch = self.inference(batch)
-            self.p1_pred.append(p1_pred_batch)
-            self.q1.append(batch.emb_clean)
+
+            self.p1_loss_metric.append(
+                ids=batch.id,
+                predictions=p1_pred_batch,
+                targets=batch.emb_clean.data[:, 0, :, :].to(self.device),
+            )
 
             self.wer_stats.append(
                 ids=batch.id,
@@ -112,13 +115,31 @@ class SEBrain(sb.Brain):
         self.epoch = epoch
 
         # Set up evaluation-only statistics trackers
-        if stage != sb.Stage.TRAIN and epoch % self.hparams.validate_every == 0:
-            self.p1_pred = []
-            self.q1 = []
+        if stage == sb.Stage.VALID:
+            if epoch % self.hparams.validate_every == 0:
+                self.wer_stats = sb.utils.metric_stats.ErrorRateStats()
+                self.cer_stats = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
+                self.whisper_model = whisper.load_model(
+                    self.hparams.whisper_model,
+                )
+
+                self.p1_loss_metric = sb.utils.metric_stats.MetricStats(
+                    metric=lambda predictions, targets: torch.mean(
+                        (predictions - targets) ** 2
+                    )[None]
+                )
+
+        elif stage == sb.Stage.TEST:
             self.wer_stats = sb.utils.metric_stats.ErrorRateStats()
             self.cer_stats = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
             self.whisper_model = whisper.load_model(
                 self.hparams.whisper_model,
+            )
+
+            self.p1_loss_metric = sb.utils.metric_stats.MetricStats(
+                metric=lambda predictions, targets: torch.mean(
+                    (predictions - targets) ** 2
+                )[None]
             )
 
     def on_stage_end(self, stage, stage_loss, epoch=None):
@@ -141,20 +162,15 @@ class SEBrain(sb.Brain):
         # Summarize the statistics from the stage for record-keeping.
         else:
             if epoch % self.hparams.validate_every == 0:
-                ot_cost = wasserstein(
-                    torch.concatenate(self.p1_pred), torch.concatenate(self.q1)
-                )
-                print(ot_cost)
                 stats = {
                     "loss": stage_loss,
                     "wer": self.wer_stats.summarize("WER"),
                     "cer": self.cer_stats.summarize("WER"),
+                    "p1_loss": self.p1_loss_metric.summarize("average"),
                 }
 
                 self.whisper_model = self.whisper_model.cpu()
                 del self.whisper_model
-                del self.p1_pred
-                del self.q1
 
             else:
                 stats = {
@@ -293,74 +309,6 @@ if __name__ == "__main__":
             },
         )
 
-    # wer_stats = hparams["wer_stats"]
-    # wer_stats.append("hi", predict="hello", target="hello")
-    #
-    # normalizer = hparams["text_normalizer"]
-    #
-    # def get_txt_list(split, key, normalizer):
-    #     with open(hparams[f"{split}_annotation"], "r") as f:
-    #         json_test = json.load(f)
-    #     if key == "utt_id":
-    #         return json_test.keys()
-    #     else:
-    #         txt = [normalizer(utt[key]) for utt in json_test.values()]
-    #         return txt
-    #
-    # utt_ids = get_txt_list("test", "utt_id", normalizer)
-    # txt_label = get_txt_list("test", "txt_label", normalizer)
-    # txt_clean = get_txt_list("test", "txt_clean", normalizer)
-    # txt_noisy = get_txt_list("test", "txt_noisy", normalizer)
-    #
-    # wer_stats.clear()
-    # wer_stats.append(
-    #     ids=utt_ids,
-    #     predict=txt_clean,
-    #     target=txt_label,
-    # )
-    # print(wer_stats.summarize())
-    # wer_stats.clear()
-    # wer_stats.append(
-    #     ids=utt_ids,
-    #     predict=txt_noisy,
-    #     target=txt_label,
-    # )
-    # print(wer_stats.summarize())
-    # wer_stats.clear()
-    # wer_stats.append(
-    #     ids=utt_ids,
-    #     predict=txt_noisy,
-    #     target=txt_clean,
-    # )
-    # print(wer_stats.summarize())
-    #
-    # utt_ids = get_txt_list("valid", "utt_id", normalizer)
-    # txt_label = get_txt_list("valid", "txt_label", normalizer)
-    # txt_clean = get_txt_list("valid", "txt_clean", normalizer)
-    # txt_noisy = get_txt_list("valid", "txt_noisy", normalizer)
-    #
-    # wer_stats.clear()
-    # wer_stats.append(
-    #     ids=utt_ids,
-    #     predict=txt_clean,
-    #     target=txt_label,
-    # )
-    # print(wer_stats.summarize())
-    # wer_stats.clear()
-    # wer_stats.append(
-    #     ids=utt_ids,
-    #     predict=txt_noisy,
-    #     target=txt_label,
-    # )
-    # print(wer_stats.summarize())
-    # wer_stats.clear()
-    # wer_stats.append(
-    #     ids=utt_ids,
-    #     predict=txt_noisy,
-    #     target=txt_clean,
-    # )
-    # print(wer_stats.summarize())
-
     # Create dataset objects "train" and "valid"
     datasets = dataio_prep(hparams)
 
@@ -385,7 +333,7 @@ if __name__ == "__main__":
         valid_loader_kwargs=hparams["dataloader_options"],
     )
 
-    # Load best checkpoint (highest STOI) for evaluation
+    # Load best checkpoint for evaluation
     test_stats = se_brain.evaluate(
         test_set=datasets["test"],
         max_key="stoi",
