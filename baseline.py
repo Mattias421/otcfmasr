@@ -5,9 +5,7 @@ from hyperpyyaml import load_hyperpyyaml
 from data_prepare import prepare_data
 
 import speechbrain as sb
-import whisper
-
-from utils_wspr import transcribe_embeddings
+from speechbrain.inference.ASR import EncoderDecoderASR
 
 
 # Brain class for speech enhancement training
@@ -34,14 +32,15 @@ class SEBrain(sb.Brain):
 
         from tqdm import tqdm
 
+        model = EncoderDecoderASR.from_hparams(
+            source="speechbrain/asr-conformer-largescaleasr",
+            savedir="./pretrained_models/asr-conformer-largescaleasr",
+        )
+
         wer_stats_noisy = sb.utils.metric_stats.ErrorRateStats()
         cer_stats_noisy = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
         wer_stats_clean = sb.utils.metric_stats.ErrorRateStats()
         cer_stats_clean = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
-
-        whisper_model = whisper.load_model(
-            self.hparams.whisper_model,
-        )
 
         p1_loss_metric = sb.utils.metric_stats.MetricStats(
             metric=lambda predictions, targets: torch.mean(
@@ -54,43 +53,52 @@ class SEBrain(sb.Brain):
                 emb_noisy = batch["emb_noisy"].to(self.device)
                 emb_clean = batch["emb_clean"].to(self.device)
 
-                wspr_result = transcribe_embeddings(
-                    whisper_model, emb_noisy, language="en"
-                )["text"]
-                print(wspr_result)
-                print(self.hparams.text_normalizer(wspr_result))
+                if model.transducer_beam_search:
+                    inputs = [emb_noisy]
+                else:
+                    wav_lens = torch.tensor([1.0], device=self.device)
+                    inputs = [emb_noisy, wav_lens]
+                predicted_tokens, _, _, _ = model.mods.decoder(*inputs)
+                result = [
+                    model.tokenizer.decode_ids(token_seq)
+                    for token_seq in predicted_tokens
+                ]
 
                 wer_stats_noisy.append(
                     ids=[batch["id"]],
-                    predict=[self.hparams.text_normalizer(wspr_result).split(" ")],
+                    predict=[self.hparams.text_normalizer(result).split(" ")],
                     target=[
                         self.hparams.text_normalizer(batch["txt_label"]).split(" ")
                     ],
                 )
                 cer_stats_noisy.append(
                     ids=[batch["id"]],
-                    predict=[self.hparams.text_normalizer(wspr_result)],
+                    predict=[self.hparams.text_normalizer(result)],
                     target=[self.hparams.text_normalizer(batch["txt_label"])],
                 )
 
-                wspr_result = transcribe_embeddings(
-                    whisper_model, emb_clean, language="en"
-                )["text"]
-                print(wspr_result)
-                print(batch["txt_label"])
+                if model.transducer_beam_search:
+                    inputs = [emb_clean]
+                else:
+                    wav_lens = torch.tensor([1.0], device=self.device)
+                    inputs = [emb_clean, wav_lens]
+                predicted_tokens, _, _, _ = model.mods.decoder(*inputs)
+                result = [
+                    model.tokenizer.decode_ids(token_seq)
+                    for token_seq in predicted_tokens
+                ]
+
                 wer_stats_clean.append(
                     ids=[batch["id"]],
-                    predict=[self.hparams.text_normalizer(wspr_result).split(" ")],
+                    predict=[self.hparams.text_normalizer(result).split(" ")],
                     target=[
                         self.hparams.text_normalizer(batch["txt_label"]).split(" ")
                     ],
                 )
                 cer_stats_clean.append(
                     ids=[batch["id"]],
-                    predict=[self.hparams.text_normalizer(wspr_result).split(" ")],
-                    target=[
-                        self.hparams.text_normalizer(batch["txt_label"]).split(" ")
-                    ],
+                    predict=[self.hparams.text_normalizer(result)],
+                    target=[self.hparams.text_normalizer(batch["txt_label"])],
                 )
 
                 p1_loss_metric.append(
@@ -145,16 +153,41 @@ def dataio_prep(hparams):
 
     # Define audio pipeline. Adds noise, reverb, and babble on-the-fly.
     # Of course for a real enhancement dataset, you'd want a fixed valid set.
-    @sb.utils.data_pipeline.takes(
-        "path_emb_noisy", "path_emb_clean", "txt_noisy", "txt_clean", "txt_label"
-    )
-    @sb.utils.data_pipeline.provides(
-        "emb_noisy", "emb_clean", "txt_noisy", "txt_clean", "txt_label"
-    )
-    def audio_pipeline(path_emb_noisy, path_emb_clean, txt_noisy, txt_clean, txt_label):
+    # @sb.utils.data_pipeline.takes(
+    #     , "txt_noisy", "txt_clean", "txt_label"
+    # )
+    # @sb.utils.data_pipeline.provides(
+    #     "emb_noisy", "emb_clean", "txt_noisy", "txt_clean", "txt_label"
+    # )
+    # def audio_pipeline(path_emb_noisy, path_emb_clean, txt_noisy, txt_clean, txt_label):
+    #     , txt_noisy, txt_clean, txt_label
+
+    # 2. Define audio pipeline:
+    @sb.utils.data_pipeline.takes("path_emb_noisy", "path_emb_clean")
+    @sb.utils.data_pipeline.provides("emb_noisy", "emb_clean")
+    def audio_pipeline(path_emb_noisy, path_emb_clean):
         emb_noisy = torch.load(path_emb_noisy)
         emb_clean = torch.load(path_emb_clean)
-        return emb_noisy, emb_clean, txt_noisy, txt_clean, txt_label
+        return emb_noisy, emb_clean
+
+    # 3. Define text pipeline:
+    @sb.utils.data_pipeline.takes("wrd")
+    @sb.utils.data_pipeline.provides(
+        "wrd", "tokens_list", "tokens_bos", "tokens_eos", "tokens"
+    )
+    def text_pipeline(wrd):
+        if "normalized_transcripts" in hparams and hparams["normalized_transcripts"]:
+            wrd = tokenizer.normalize(wrd)
+        yield wrd
+        tokens_list = tokenizer.encode(wrd, add_special_tokens=False)
+        yield tokens_list
+        tokens_list = tokenizer.build_inputs_with_special_tokens(tokens_list)
+        tokens_bos = torch.LongTensor(tokens_list[:-1])
+        yield tokens_bos
+        tokens_eos = torch.LongTensor(tokens_list[1:])
+        yield tokens_eos
+        tokens = torch.LongTensor(tokens_list)
+        yield tokens
 
     # Define datasets sorted by ascending lengths for efficiency
     datasets = {}
@@ -168,7 +201,7 @@ def dataio_prep(hparams):
         datasets[dataset] = sb.dataio.dataset.DynamicItemDataset.from_json(
             json_path=data_info[dataset],
             replacements={"data_root": hparams["data_folder"]},
-            dynamic_items=[audio_pipeline],
+            dynamic_items=[audio_pipeline, text_pipeline],
             output_keys=[
                 "id",
                 "emb_noisy",
@@ -218,8 +251,11 @@ if __name__ == "__main__":
             },
         )
 
+    # Defining tokenizer and loading it
+    tokenizer = hparams["whisper"].tokenizer
+
     # Create dataset objects "train" and "valid"
-    datasets = dataio_prep(hparams)
+    datasets = dataio_prep(hparams, tokenizer)
 
     # Initialize the Brain object to prepare for mask training.
     se_brain = SEBrain(

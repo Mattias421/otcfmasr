@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 from tqdm import tqdm
 from speechbrain.inference.ASR import EncoderDecoderASR
+from speechbrain.lobes.models.huggingface_transformers.whisper import Whisper
 from speechbrain.dataio.dataio import read_audio  # More robust audio reading
 
 # Define a mapping for common SpeechBrain ASR models
@@ -12,11 +13,12 @@ SPEECHBRAIN_MODELS = {
     "conformer-largescale": "speechbrain/asr-conformer-largescaleasr",
     "conformer-librispeech": "speechbrain/asr-conformer-transformerlm-librispeech",
     "wav2vec2-base-960h": "speechbrain/asr-wav2vec2-commonvoice-en",
+    "whisper-tiny": "openai/whisper-tiny",
     # Add other relevant models if desired
 }
 
 
-def process_file(model, audio_path, output_emb_path, output_txt_path, device):
+def process_file(model, model_id, audio_path, output_emb_path, device):
     """
     Processes a single audio file to extract SpeechBrain encoder embedding and transcription.
 
@@ -28,54 +30,29 @@ def process_file(model, audio_path, output_emb_path, output_txt_path, device):
         device (str): The device to use ('cuda' or 'cpu').
     """
     try:
-        # 1. Load audio using SpeechBrain's robust reader
-        #    This handles different formats and sample rates better potentially
-        #    The model expects 16kHz, transcribe_file handles resampling,
-        #    for encode_batch we might need manual resampling if not 16kHz.
-        #    Let's load first and check sample rate if needed for encode_batch.
         signal = read_audio(audio_path)
         # Ensure signal is 2D [batch, time] as encode_batch expects batch dim
         if signal.ndim == 1:
             signal = signal.unsqueeze(0)
         signal = signal.to(device)
 
-        # --- Check Sample Rate (Optional but recommended for encode_batch) ---
-        # info = torchaudio.info(audio_path)
-        # target_sr = model.hparams.sample_rate # Typically 16000
-        # if info.sample_rate != target_sr:
-        #     print(f"Warning: Resampling {audio_path} from {info.sample_rate} to {target_sr}")
-        #     # Create a resampler - initialize only once if possible outside the loop for efficiency
-        #     resampler = torchaudio.transforms.Resample(orig_freq=info.sample_rate, new_freq=target_sr).to(device)
-        #     signal = resampler(signal)
-        # --- End Optional Resampling ---
-
-        # 2. Get audio embedding (Encoder Output)
-        #    encode_batch expects [batch, time] and relative lengths
-        #    For a single file, length is 1.0
         with torch.no_grad():
-            wav_lens = torch.tensor([1.0], device=device)
-            # encoder_out shape: [batch, time_steps, features]
-            encoder_out = model.encode_batch(signal, wav_lens)
+            if "openai" in model_id:
+                mel = model._get_mel(signal)
 
-            # Aggregate encoder output sequence to a single embedding vector
-            # Mean pooling over time steps is a common strategy
-            # Result shape: [batch, features]
-            # Remove batch dimension: [features]
-            final_embedding = encoder_out.squeeze(0)
+                encoder_out = model.forward_encoder(mel)
 
-        # 3. Transcribe audio for text
-        #    Use the convenient transcribe_file method
-        transcription = model.transcribe_file(audio_path)
+            else:
+                wav_lens = torch.tensor([1.0], device=device)
+                # encoder_out shape: [batch, time_steps, features]
+                encoder_out = model.encode_batch(signal, wav_lens)
+
+        final_embedding = encoder_out.squeeze(0)
 
         # 4. Save embedding
         Path(output_emb_path).parent.mkdir(parents=True, exist_ok=True)
         # Save on CPU to avoid GPU memory issues when loading later
         torch.save(final_embedding.cpu(), output_emb_path)
-
-        # 5. Save transcription
-        Path(output_txt_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_txt_path, "w", encoding="utf-8") as f:
-            f.write(transcription)
 
         return True  # Indicate success
 
@@ -86,11 +63,6 @@ def process_file(model, audio_path, output_emb_path, output_txt_path, device):
             try:
                 os.remove(output_emb_path)
             except OSError:  # Handle potential race conditions or permission issues
-                pass
-        if Path(output_txt_path).exists():
-            try:
-                os.remove(output_txt_path)
-            except OSError:
                 pass
         return False  # Indicate failure
 
@@ -113,7 +85,6 @@ def get_sb_features(
     output_base = Path(output_dir)
     # Consider renaming output dirs slightly to reflect SpeechBrain source
     output_emb_dir = output_base / "audio_emb"
-    output_txt_dir = output_base / "txt_sb"  # Or keep as "txt" if preferred
 
     if not input_base.is_dir():
         print(f"Error: Input directory '{input_dir}' not found.")
@@ -132,13 +103,27 @@ def get_sb_features(
 
     print(f"Using device: {device}")
     try:
-        # Load the SpeechBrain model
-        asr_model = EncoderDecoderASR.from_hparams(
-            source=model_id, savedir=savedir, run_opts={"device": device}
-        )
-        # Ensure model is on the correct device (from_hparams might handle this via run_opts, but explicit is safe)
-        asr_model.to(device)
-        asr_model.eval()  # Set model to evaluation mode
+        if "openai" in model_id:
+            asr_model = Whisper(
+                source=model_id,
+                save_path=f"{savedir}/{model_id}",
+                encoder_only=True,
+                freeze=True,
+                language="en",
+            )
+            asr_model.to(device)
+            asr_model.eval()  # Set model to evaluation mode
+
+        else:
+            # Load the SpeechBrain model
+            asr_model = EncoderDecoderASR.from_hparams(
+                source=model_id,
+                savedir=f"{savedir}/{model_id}",
+                run_opts={"device": device},
+            )
+            # Ensure model is on the correct device (from_hparams might handle this via run_opts, but explicit is safe)
+            asr_model.to(device)
+            asr_model.eval()  # Set model to evaluation mode
 
     except Exception as e:
         print(f"Error loading SpeechBrain model '{model_id}': {e}")
@@ -165,7 +150,6 @@ def get_sb_features(
         for condition in conditions:
             current_input_dir = input_base / split / condition
             current_output_emb_dir = output_emb_dir / split / condition
-            current_output_txt_dir = output_txt_dir / split / condition
 
             if not current_input_dir.is_dir():
                 print(f"Warning: Directory not found, skipping: {current_input_dir}")
@@ -181,7 +165,6 @@ def get_sb_features(
 
             # Create output directories for the current subset
             current_output_emb_dir.mkdir(parents=True, exist_ok=True)
-            current_output_txt_dir.mkdir(parents=True, exist_ok=True)
 
             progress_bar = tqdm(
                 wav_files, desc=f"{split}/{condition}", unit="file", leave=False
@@ -189,13 +172,8 @@ def get_sb_features(
             for wav_path in progress_bar:
                 file_stem = wav_path.stem
                 output_emb_path = current_output_emb_dir / f"{file_stem}.pt"
-                output_txt_path = current_output_txt_dir / f"{file_stem}.txt"
 
-                if (
-                    not force_overwrite
-                    and output_emb_path.exists()
-                    and output_txt_path.exists()
-                ):
+                if not force_overwrite and output_emb_path.exists():
                     total_files_skipped += 1
                     continue
 
@@ -205,9 +183,9 @@ def get_sb_features(
 
                 success = process_file(
                     asr_model,  # Pass the SpeechBrain model
+                    model_id,
                     str(wav_path),
                     str(output_emb_path),
-                    str(output_txt_path),
                     device,  # Pass the determined device
                 )
 

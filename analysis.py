@@ -70,6 +70,7 @@ def umap(emb_dir, split, aggregate="mean", N=100):
             clean_data.append(clean_emb.numpy())
             noisy_data.append(noisy_emb.numpy())
 
+    breakpoint()
     reducer = UMAP()
     if aggregate == "mean":
         umap_emb = reducer.fit_transform(np.concatenate(clean_data + noisy_data))
@@ -86,7 +87,6 @@ def umap(emb_dir, split, aggregate="mean", N=100):
 
     plt.show()
 
-    breakpoint()
     ot_sampler = OTPlanSampler(method="exact")
     noisy_data_ot, clean_data_ot, label_x, label_y = ot_sampler.sample_plan_with_labels(
         torch.tensor(np.concatenate(noisy_data).reshape(N, -1)),

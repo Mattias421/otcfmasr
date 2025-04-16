@@ -10,6 +10,7 @@ dependencies = [
     "soundfile>=0.13.1",
     "speechbrain>=1.0.3",
     "torchcfm>=1.0.7",
+    "transformers>=4.51.3",
     "umap-learn>=0.5.7",
     "wandb>=0.19.9",
 ]
