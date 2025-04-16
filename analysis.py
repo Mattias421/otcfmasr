@@ -58,7 +58,6 @@ def umap(emb_dir, split, aggregate="mean", N=100):
 
     for clean_emb_file in sorted(list(clean_path.glob("*.pt")))[:N]:
         file_id = clean_emb_file.stem
-        print(file_id)
         noisy_emb_file = noisy_path / f"{file_id}.pt"
 
         clean_emb = torch.load(clean_emb_file)
@@ -81,18 +80,17 @@ def umap(emb_dir, split, aggregate="mean", N=100):
     plt.scatter(umap_emb[:N, 0], umap_emb[:N, 1], c="b", marker="o")
     plt.scatter(umap_emb[N:, 0], umap_emb[N:, 1], c="r", marker="+")
 
-    plt.scatter(umap_emb[353:N, 0], umap_emb[353:N, 1], c="g", marker="o")
-    plt.scatter(umap_emb[N : N + 353, 0], umap_emb[N : N + 353, 1], c="g", marker="+")
     for noisy_sample, clean_sample in zip(umap_emb[N:], umap_emb[:N]):
         d = clean_sample - noisy_sample
         plt.arrow(noisy_sample[0], noisy_sample[1], d[0], d[1], alpha=0.5)
 
     plt.show()
 
+    breakpoint()
     ot_sampler = OTPlanSampler(method="exact")
     noisy_data_ot, clean_data_ot, label_x, label_y = ot_sampler.sample_plan_with_labels(
-        torch.tensor(np.concatenate(noisy_data)),
-        torch.tensor(np.concatenate(clean_data)),
+        torch.tensor(np.concatenate(noisy_data).reshape(N, -1)),
+        torch.tensor(np.concatenate(clean_data).reshape(N, -1)),
         torch.arange(N),
         torch.arange(N),
         replace=False,

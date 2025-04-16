@@ -60,9 +60,8 @@ def process_file(model, audio_path, output_emb_path, output_txt_path, device):
             # Aggregate encoder output sequence to a single embedding vector
             # Mean pooling over time steps is a common strategy
             # Result shape: [batch, features]
-            aggregated_embedding = torch.mean(encoder_out, dim=1)
             # Remove batch dimension: [features]
-            final_embedding = aggregated_embedding.squeeze(0)
+            final_embedding = encoder_out.squeeze(0)
 
         # 3. Transcribe audio for text
         #    Use the convenient transcribe_file method
@@ -113,7 +112,7 @@ def get_sb_features(
     input_base = Path(input_dir)
     output_base = Path(output_dir)
     # Consider renaming output dirs slightly to reflect SpeechBrain source
-    output_emb_dir = output_base / "audio_sb_emb"
+    output_emb_dir = output_base / "audio_emb"
     output_txt_dir = output_base / "txt_sb"  # Or keep as "txt" if preferred
 
     if not input_base.is_dir():
