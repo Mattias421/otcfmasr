@@ -161,6 +161,7 @@ dmypy.json
 **/model_checkpoints/
 **/pretrained_model_checkpoints/
 **/pretrained_models/
+pretrained_models/
 
 # Results folders
 **/results/

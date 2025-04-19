@@ -5,10 +5,9 @@ from hyperpyyaml import load_hyperpyyaml
 from data_prepare import prepare_data
 
 import speechbrain as sb
-import whisper
+from speechbrain.utils.data_utils import undo_padding
+from speechbrain.utils import hpopt as hp
 from torchdyn.core import NeuralODE
-
-from utils_wspr import transcribe_embeddings
 
 
 # Brain class for speech enhancement training
@@ -33,8 +32,8 @@ class SEBrain(sb.Brain):
         # We first move the batch to the appropriate device, and
         # compute the features necessary for masking.
 
-        emb_noisy = batch.emb_noisy.data[:, 0, :, :].to(self.device)
-        emb_clean = batch.emb_clean.data[:, 0, :, :].to(self.device)
+        emb_noisy = batch.emb_noisy.data.to(self.device)
+        emb_clean = batch.emb_clean.data.to(self.device)
 
         t, xt, ut = self.hparams.flow_matcher.sample_location_and_conditional_flow(
             emb_noisy, emb_clean
@@ -42,8 +41,13 @@ class SEBrain(sb.Brain):
 
         ut_pred, _ = self.modules.model(xt)
 
-        # Return a dictionary so we don't have to remember the order
-        return {"ut": ut, "ut_pred": ut_pred}
+        if (
+            stage == sb.Stage.VALID and self.epoch % self.hparams.validate_every == 0
+        ) or stage == sb.Stage.TEST:
+            hyps, p1_pred = self.inference(batch, stage)
+            return {"ut": ut, "ut_pred": ut_pred, "hyps": hyps, "p1_pred": p1_pred}
+        else:
+            return {"ut": ut, "ut_pred": ut_pred}
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given the predicted and targeted outputs.
@@ -72,25 +76,49 @@ class SEBrain(sb.Brain):
 
         # Some evaluations are slower, and we only want to perform them
         # on the validation set.
-        if stage != sb.Stage.TRAIN and self.epoch % self.hparams.validate_every == 0:
+        if (stage != sb.Stage.TRAIN) and (
+            self.epoch % self.hparams.validate_every == 0
+        ):
             txt_hyp, p1_pred_batch = self.inference(batch)
+
+            hyps = predictions["hyps"]
+            p1_pred = predictions["p1_pred"]
+
+            tokens, tokens_lens = batch.tokens
+            target_words = undo_padding(tokens, tokens_lens)
+
+            # Decode token terms to words
+            predicted_words = [
+                self.tokenizer.decode(t, skip_special_tokens=True).strip() for t in hyps
+            ]
+
+            # Convert indices to words
+            target_words = self.tokenizer.batch_decode(
+                target_words, skip_special_tokens=True
+            )
+            if hasattr(self.hparams, "normalized_transcripts"):
+                if hasattr(self.tokenizer, "normalize"):
+                    normalized_fn = self.tokenizer.normalize
+                else:
+                    normalized_fn = self.tokenizer._normalize
+
+                predicted_words = [
+                    normalized_fn(text).split(" ") for text in predicted_words
+                ]
+
+                target_words = [normalized_fn(text).split(" ") for text in target_words]
+            else:
+                predicted_words = [text.split(" ") for text in predicted_words]
+                target_words = [text.split(" ") for text in target_words]
 
             self.p1_loss_metric.append(
                 ids=batch.id,
-                predictions=p1_pred_batch,
-                targets=batch.emb_clean.data[:, 0, :, :].to(self.device),
+                predictions=p1_pred,
+                targets=batch.emb_clean.data.to(self.device),
             )
 
-            self.wer_stats.append(
-                ids=batch.id,
-                predict=[self.hparams.text_normalizer(txt) for txt in txt_hyp],
-                target=[self.hparams.text_normalizer(txt) for txt in batch.txt_label],
-            )
-            self.cer_stats.append(
-                ids=batch.id,
-                predict=[self.hparams.text_normalizer(txt) for txt in txt_hyp],
-                target=[self.hparams.text_normalizer(txt) for txt in batch.txt_label],
-            )
+            self.wer_stats.append(batch.id, predicted_words, target_words)
+            self.cer_stats.append(batch.id, predicted_words, target_words)
 
         return cfm_loss
 
@@ -119,28 +147,26 @@ class SEBrain(sb.Brain):
             if epoch % self.hparams.validate_every == 0:
                 self.wer_stats = sb.utils.metric_stats.ErrorRateStats()
                 self.cer_stats = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
-                self.whisper_model = whisper.load_model(
-                    self.hparams.whisper_model,
-                )
 
                 self.p1_loss_metric = sb.utils.metric_stats.MetricStats(
                     metric=lambda predictions, targets: torch.mean(
                         (predictions - targets) ** 2
                     )[None]
                 )
+                self.hparams.valid_search.model.to(self.device)
 
         elif stage == sb.Stage.TEST:
+            self.epoch = self.hparams.validate_every
             self.wer_stats = sb.utils.metric_stats.ErrorRateStats()
             self.cer_stats = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
-            self.whisper_model = whisper.load_model(
-                self.hparams.whisper_model,
-            )
 
             self.p1_loss_metric = sb.utils.metric_stats.MetricStats(
                 metric=lambda predictions, targets: torch.mean(
                     (predictions - targets) ** 2
                 )[None]
             )
+
+            self.hparams.test_search.model.to(self.device)
 
     def on_stage_end(self, stage, stage_loss, epoch=None):
         """Gets called at the end of an epoch.
@@ -161,16 +187,19 @@ class SEBrain(sb.Brain):
 
         # Summarize the statistics from the stage for record-keeping.
         else:
-            if epoch % self.hparams.validate_every == 0:
-                stats = {
-                    "loss": stage_loss,
-                    "wer": self.wer_stats.summarize("WER"),
-                    "cer": self.cer_stats.summarize("WER"),
-                    "p1_loss": self.p1_loss_metric.summarize("average"),
-                }
-
-                self.whisper_model = self.whisper_model.cpu()
-                del self.whisper_model
+            if stage == sb.Stage.VALID:
+                if epoch % self.hparams.validate_every == 0:
+                    stats = {
+                        "loss": stage_loss,
+                        "wer": self.wer_stats.summarize("WER"),
+                        "cer": self.cer_stats.summarize("WER"),
+                        "p1_loss": self.p1_loss_metric.summarize("average"),
+                    }
+                    self.hparams.valid_search.model.cpu()
+                else:
+                    stats = {
+                        "loss": stage_loss,
+                    }
 
             else:
                 stats = {
@@ -188,7 +217,10 @@ class SEBrain(sb.Brain):
 
             # Save the current checkpoint and delete previous checkpoints,
             # unless they have the current best STOI score.
-            self.checkpointer.save_and_keep_only(meta=stats, min_keys=["wer"])
+            if self.hparams.ckpt_enable:
+                self.checkpointer.save_and_keep_only(meta=stats, min_keys=["wer"])
+
+            hp.report_result(stats)
 
         # We also write statistics about test data to stdout and to the logfile.
         if stage == sb.Stage.TEST:
@@ -196,10 +228,11 @@ class SEBrain(sb.Brain):
                 {"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stats,
             )
+            self.hparams.test_search.model.cpu()
 
     @torch.no_grad
-    def inference(self, batch):
-        emb_noisy = batch.emb_noisy.data[:, 0, :, :].to(self.device)
+    def inference(self, batch, stage=None):
+        emb_noisy = batch.emb_noisy.data.to(self.device)
 
         def vt(t, x, args):
             model_out, _ = self.modules.model(x)
@@ -208,18 +241,22 @@ class SEBrain(sb.Brain):
         node = NeuralODE(vt, solver="euler", sensitivity="adjoint")
         traj = node.trajectory(emb_noisy, t_span=torch.linspace(0, 1, 50))
 
-        results = []
-        for emb_clean_pred in traj[-1]:
-            wspr_result = transcribe_embeddings(
-                self.whisper_model, emb_clean_pred, language="en"
-            )
+        emb_pred = traj[-1]
+        traj.cpu()
 
-            results.append(wspr_result["text"])
+        wav_lens = batch.wav_len / batch.wav_len.max()
 
-        return results, traj[-1]
+        # breakpoint()
+
+        if stage == sb.Stage.TEST:
+            hyps, _, _, _ = self.hparams.test_search(emb_pred, wav_lens)
+        else:
+            hyps, _, _, _ = self.hparams.valid_search(emb_pred, wav_lens)
+
+        return hyps, emb_pred
 
 
-def dataio_prep(hparams):
+def dataio_prep(hparams, tokenizer):
     """This function prepares the datasets to be used in the brain class.
     It also defines the data processing pipeline through user-defined functions.
 
@@ -241,16 +278,33 @@ def dataio_prep(hparams):
 
     # Define audio pipeline. Adds noise, reverb, and babble on-the-fly.
     # Of course for a real enhancement dataset, you'd want a fixed valid set.
-    @sb.utils.data_pipeline.takes(
-        "path_emb_noisy", "path_emb_clean", "txt_noisy", "txt_clean", "txt_label"
-    )
-    @sb.utils.data_pipeline.provides(
-        "emb_noisy", "emb_clean", "txt_noisy", "txt_clean", "txt_label"
-    )
-    def audio_pipeline(path_emb_noisy, path_emb_clean, txt_noisy, txt_clean, txt_label):
+
+    # 2. Define audio pipeline:
+    @sb.utils.data_pipeline.takes("path_emb_noisy", "path_emb_clean", "wav_len")
+    @sb.utils.data_pipeline.provides("emb_noisy", "emb_clean", "wav_len")
+    def audio_pipeline(path_emb_noisy, path_emb_clean, wav_len):
         emb_noisy = torch.load(path_emb_noisy)
         emb_clean = torch.load(path_emb_clean)
-        return emb_noisy, emb_clean, txt_noisy, txt_clean, txt_label
+        return emb_noisy, emb_clean, wav_len
+
+    # 3. Define text pipeline:
+    @sb.utils.data_pipeline.takes("wrd")
+    @sb.utils.data_pipeline.provides(
+        "wrd", "tokens_list", "tokens_bos", "tokens_eos", "tokens"
+    )
+    def text_pipeline(wrd):
+        if "normalized_transcripts" in hparams and hparams["normalized_transcripts"]:
+            wrd = tokenizer.normalize(wrd)
+        yield wrd
+        tokens_list = tokenizer.encode(wrd, add_special_tokens=False)
+        yield tokens_list
+        tokens_list = tokenizer.build_inputs_with_special_tokens(tokens_list)
+        tokens_bos = torch.LongTensor(tokens_list[:-1])
+        yield tokens_bos
+        tokens_eos = torch.LongTensor(tokens_list[1:])
+        yield tokens_eos
+        tokens = torch.LongTensor(tokens_list)
+        yield tokens
 
     # Define datasets sorted by ascending lengths for efficiency
     datasets = {}
@@ -264,14 +318,16 @@ def dataio_prep(hparams):
         datasets[dataset] = sb.dataio.dataset.DynamicItemDataset.from_json(
             json_path=data_info[dataset],
             replacements={"data_root": hparams["data_folder"]},
-            dynamic_items=[audio_pipeline],
+            dynamic_items=[audio_pipeline, text_pipeline],
             output_keys=[
                 "id",
                 "emb_noisy",
                 "emb_clean",
-                "txt_noisy",
-                "txt_clean",
-                "txt_label",
+                "wav_len",
+                "tokens_list",
+                "tokens_bos",
+                "tokens_eos",
+                "tokens",
             ],
         )
     return datasets
@@ -279,63 +335,74 @@ def dataio_prep(hparams):
 
 # Recipe begins!
 if __name__ == "__main__":
-    # Reading command line arguments
-    hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
+    with hp.hyperparameter_optimization(objective_key="loss") as hp_ctx:
+        # Reading command line arguments
+        hparams_file, run_opts, overrides = hp_ctx.parse_arguments(sys.argv[1:])
 
-    # Initialize ddp (useful only for multi-GPU DDP training)
-    sb.utils.distributed.ddp_init_group(run_opts)
+        # Initialize ddp (useful only for multi-GPU DDP training)
+        sb.utils.distributed.ddp_init_group(run_opts)
 
-    # Load hyperparameters file with command-line overrides
-    with open(hparams_file, encoding="utf-8") as fin:
-        hparams = load_hyperpyyaml(fin, overrides)
+        # Load hyperparameters file with command-line overrides
+        with open(hparams_file, encoding="utf-8") as fin:
+            hparams = load_hyperpyyaml(fin, overrides)
 
-    # Create experiment directory
-    sb.create_experiment_directory(
-        experiment_directory=hparams["output_folder"],
-        hyperparams_to_save=hparams_file,
-        overrides=overrides,
-    )
-
-    # Data preparation, to be run on only one process.
-    if not hparams["skip_prep"]:
-        sb.utils.distributed.run_on_main(
-            prepare_data,
-            kwargs={
-                "data_folder": hparams["data_folder"],
-                "whisper_model": hparams["whisper_model"],
-                "save_json_train": hparams["train_annotation"],
-                "save_json_valid": hparams["valid_annotation"],
-                "save_json_test": hparams["test_annotation"],
-            },
+        # Create experiment directory
+        sb.create_experiment_directory(
+            experiment_directory=hparams["output_folder"],
+            hyperparams_to_save=hparams_file,
+            overrides=overrides,
         )
 
-    # Create dataset objects "train" and "valid"
-    datasets = dataio_prep(hparams)
+        import os
 
-    # Initialize the Brain object to prepare for mask training.
-    se_brain = SEBrain(
-        modules=hparams["modules"],
-        opt_class=hparams["opt_class"],
-        hparams=hparams,
-        run_opts=run_opts,
-        checkpointer=hparams["checkpointer"],
-    )
+        if not os.path.isdir(hparams["save_folder"]):
+            os.mkdir(hparams["save_folder"])
 
-    # The `fit()` method iterates the training loop, calling the methods
-    # necessary to update the parameters of the model. Since all objects
-    # with changing state are managed by the Checkpointer, training can be
-    # stopped at any point, and will be resumed on next call.
-    se_brain.fit(
-        epoch_counter=se_brain.hparams.epoch_counter,
-        train_set=datasets["train"],
-        valid_set=datasets["valid"],
-        train_loader_kwargs=hparams["dataloader_options"],
-        valid_loader_kwargs=hparams["dataloader_options"],
-    )
+        # Data preparation, to be run on only one process.
+        if not hparams["skip_prep"]:
+            sb.utils.distributed.run_on_main(
+                prepare_data,
+                kwargs={
+                    "data_folder": hparams["data_folder"],
+                    "model_id": hparams["whisper_hub"].split("/")[-1],
+                    "save_json_train": hparams["train_annotation"],
+                    "save_json_valid": hparams["valid_annotation"],
+                    "save_json_test": hparams["test_annotation"],
+                },
+            )
 
-    # Load best checkpoint for evaluation
-    test_stats = se_brain.evaluate(
-        test_set=datasets["test"],
-        max_key="stoi",
-        test_loader_kwargs=hparams["dataloader_options"],
-    )
+        # Defining tokenizer and loading it
+        tokenizer = hparams["whisper"].tokenizer
+
+        # Create dataset objects "train" and "valid"
+        datasets = dataio_prep(hparams, tokenizer)
+
+        # Initialize the Brain object to prepare for mask training.
+        se_brain = SEBrain(
+            modules=hparams["modules"],
+            opt_class=hparams["opt_class"],
+            hparams=hparams,
+            run_opts=run_opts,
+            checkpointer=hparams["checkpointer"],
+        )
+        se_brain.tokenizer = tokenizer
+
+        # The `fit()` method iterates the training loop, calling the methods
+        # necessary to update the parameters of the model. Since all objects
+        # with changing state are managed by the Checkpointer, training can be
+        # stopped at any point, and will be resumed on next call.
+        se_brain.fit(
+            epoch_counter=se_brain.hparams.epoch_counter,
+            train_set=datasets["train"],
+            valid_set=datasets["valid"],
+            train_loader_kwargs=hparams["dataloader_options"],
+            valid_loader_kwargs=hparams["dataloader_options_eval"],
+        )
+
+        if hparams["test"]:
+            # Load best checkpoint for evaluation
+            test_stats = se_brain.evaluate(
+                test_set=datasets["test"],
+                min_key="wer",
+                test_loader_kwargs=hparams["dataloader_options_eval"],
+            )

@@ -1,5 +1,6 @@
 import json
 import os
+import torchaudio
 
 from speechbrain.utils.data_utils import get_all_files
 from speechbrain.utils.logger import get_logger
@@ -8,14 +9,14 @@ logger = get_logger(__name__)
 
 
 def prepare_data(
-    data_folder, whisper_model, save_json_train, save_json_valid, save_json_test
+    data_folder, model_id, save_json_train, save_json_valid, save_json_test
 ):
     # Check if this phase is already done (if so, skip it)
     if skip(save_json_train, save_json_valid, save_json_test):
         logger.info("Preparation completed in previous run, skipping.")
         return
 
-    emb_folder = os.path.join(data_folder, f"VB+DMD_wspr_{whisper_model}")
+    emb_folder = os.path.join(data_folder, "VB+DMD", f"{model_id}")
 
     if not os.path.exists(emb_folder):
         logger.info("f{emb_folder} doesn't exist, computing audio embeddings")
@@ -26,12 +27,12 @@ def prepare_data(
         get_wspr_emb(
             input_dir=wav_folder,
             output_dir=emb_folder,
-            model_name=whisper_model,
+            model_name=model_id,
             device_arg="cuda",
             force_overwrite=True,
         )
     else:
-        logger.info(f"Whisper {whisper_model} embeddings found in {emb_folder}")
+        logger.info(f"{model_id} embeddings found in {emb_folder}")
 
     train_folder = os.path.join(emb_folder, "audio_emb", "train", "clean")
     valid_folder = os.path.join(emb_folder, "audio_emb", "valid", "clean")
@@ -68,30 +69,26 @@ def create_json(wav_list, json_file):
         emb_clean = os.path.join("/", *path_parts)
         path_parts[-2] = "noisy"
         emb_noisy = os.path.join("/", *path_parts)
-        path_parts[-4] = "txt"
-        path_parts[-1] = f"{uttid}.txt"
-        txt_noisy = os.path.join("/", *path_parts)
-        path_parts[-2] = "clean"
-        txt_clean = os.path.join("/", *path_parts)
 
         txt_label = os.path.join(
-            "/", *path_parts[:-5], "VB+DMD", "txt", path_parts[-3], path_parts[-1]
+            "/", *path_parts[:-5], "txt", path_parts[-3], f"{uttid}.txt"
         )
 
-        with open(txt_noisy, "r") as f:
-            txt_noisy = f.read()
-        with open(txt_clean, "r") as f:
-            txt_clean = f.read()
         with open(txt_label, "r") as f:
             txt_label = f.read().strip()
 
+        wav = os.path.join(
+            "/", *path_parts[:-5], path_parts[-3], path_parts[-2], f"{uttid}.wav"
+        )
+
+        wav_len = torchaudio.load(wav)[0].shape[1]
+
         # Create entry for this utterance
         json_dict[uttid] = {
-            "txt_noisy": txt_noisy,
-            "txt_clean": txt_clean,
-            "txt_label": txt_label,
+            "wrd": txt_label,
             "path_emb_noisy": emb_noisy,
             "path_emb_clean": emb_clean,
+            "wav_len": wav_len,
         }
 
     # Writing the dictionary to the json file

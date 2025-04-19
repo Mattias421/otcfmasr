@@ -1,0 +1,8 @@
+number_of_epochs: 1
+validate_every: 5
+ckpt_enable: false
+test: false
+
+trial_id: hpopt_placeholder
+output_folder: !ref ./results/hpopt/<trial_id>
+

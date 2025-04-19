@@ -8,12 +8,11 @@
 # #################################
 
 data_folder: ./data
-xp_name: base_default
+xp_name: baseline_default
 output_folder: !ref ./results/<xp_name>
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
-sampling_rate: 16_000
 
 # Path where data manifest files will be stored
 # The data manifest files are created by the data preparation script.
@@ -26,7 +25,9 @@ normalized_transcripts: true
 
 # whisper settings
 whisper_hub: openai/whisper-tiny
+freeze_encoder: true
 whisper_folder: !ref ./pretrained/<whisper_hub>
+sampling_rate: 16_000
 
 whisper: !new:speechbrain.lobes.models.huggingface_transformers.whisper.Whisper
     source: !ref <whisper_hub>
@@ -35,6 +36,9 @@ whisper: !new:speechbrain.lobes.models.huggingface_transformers.whisper.Whisper
     language: "english"
     task: "transcribe"
     sampling_rate: !ref <sampling_rate>
+
+modules:
+    whisper: !ref <whisper>
 
 # Decoding parameters
 min_decode_ratio: 0.0

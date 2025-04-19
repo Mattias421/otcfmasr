@@ -1,18 +1,18 @@
 import sys
+import os
 
 import torch
 from hyperpyyaml import load_hyperpyyaml
 from data_prepare import prepare_data
 
 import speechbrain as sb
-from speechbrain.inference.ASR import EncoderDecoderASR
 
 
 # Brain class for speech enhancement training
 class SEBrain(sb.Brain):
     """Class that manages the training loop. See speechbrain.core.Brain."""
 
-    def transcribe_dataset(self, dataset):
+    def transcribe_dataset(self, dataset, split):
         """Apply masking to convert from noisy waveforms to enhanced signals.
 
         Arguments
@@ -32,11 +32,6 @@ class SEBrain(sb.Brain):
 
         from tqdm import tqdm
 
-        model = EncoderDecoderASR.from_hparams(
-            source="speechbrain/asr-conformer-largescaleasr",
-            savedir="./pretrained_models/asr-conformer-largescaleasr",
-        )
-
         wer_stats_noisy = sb.utils.metric_stats.ErrorRateStats()
         cer_stats_noisy = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
         wer_stats_clean = sb.utils.metric_stats.ErrorRateStats()
@@ -48,90 +43,108 @@ class SEBrain(sb.Brain):
             )[None]
         )
 
+        self.hparams.test_search.model.to(self.device)
+
         with torch.no_grad():
             for batch in tqdm(dataset, dynamic_ncols=True):
-                emb_noisy = batch["emb_noisy"].to(self.device)
-                emb_clean = batch["emb_clean"].to(self.device)
+                emb_noisy = batch["emb_noisy"][None, :, :].to(self.device)
+                emb_clean = batch["emb_clean"][None, :, :].to(self.device)
+                wav_lens = torch.tensor([1]).to(self.device)
 
-                if model.transducer_beam_search:
-                    inputs = [emb_noisy]
-                else:
-                    wav_lens = torch.tensor([1.0], device=self.device)
-                    inputs = [emb_noisy, wav_lens]
-                predicted_tokens, _, _, _ = model.mods.decoder(*inputs)
-                result = [
-                    model.tokenizer.decode_ids(token_seq)
-                    for token_seq in predicted_tokens
+                # eval noisy
+                hyps, _, _, _ = self.hparams.test_search(emb_noisy.detach(), wav_lens)
+
+                tokens = [batch["tokens"]]
+
+                # Decode token terms to words
+                predicted_words = [
+                    self.tokenizer.decode(t, skip_special_tokens=True).strip()
+                    for t in hyps
                 ]
 
-                wer_stats_noisy.append(
-                    ids=[batch["id"]],
-                    predict=[self.hparams.text_normalizer(result).split(" ")],
-                    target=[
-                        self.hparams.text_normalizer(batch["txt_label"]).split(" ")
-                    ],
+                # Convert indices to words
+                target_words = self.tokenizer.batch_decode(
+                    tokens, skip_special_tokens=True
                 )
-                cer_stats_noisy.append(
-                    ids=[batch["id"]],
-                    predict=[self.hparams.text_normalizer(result)],
-                    target=[self.hparams.text_normalizer(batch["txt_label"])],
-                )
+                if hasattr(self.hparams, "normalized_transcripts"):
+                    if hasattr(self.tokenizer, "normalize"):
+                        normalized_fn = self.tokenizer.normalize
+                    else:
+                        normalized_fn = self.tokenizer._normalize
 
-                if model.transducer_beam_search:
-                    inputs = [emb_clean]
+                    predicted_words = [
+                        normalized_fn(text).split(" ") for text in predicted_words
+                    ]
+
+                    target_words = [
+                        normalized_fn(text).split(" ") for text in target_words
+                    ]
                 else:
-                    wav_lens = torch.tensor([1.0], device=self.device)
-                    inputs = [emb_clean, wav_lens]
-                predicted_tokens, _, _, _ = model.mods.decoder(*inputs)
-                result = [
-                    model.tokenizer.decode_ids(token_seq)
-                    for token_seq in predicted_tokens
+                    predicted_words = [text.split(" ") for text in predicted_words]
+                    target_words = [text.split(" ") for text in target_words]
+
+                wer_stats_noisy.append([batch["id"]], predicted_words, target_words)
+                cer_stats_noisy.append([batch["id"]], predicted_words, target_words)
+
+                # eval clean
+                hyps, _, _, _ = self.hparams.test_search(emb_clean.detach(), wav_lens)
+
+                tokens = [batch["tokens"]]
+
+                # Decode token terms to words
+                predicted_words = [
+                    self.tokenizer.decode(t, skip_special_tokens=True).strip()
+                    for t in hyps
                 ]
 
-                wer_stats_clean.append(
-                    ids=[batch["id"]],
-                    predict=[self.hparams.text_normalizer(result).split(" ")],
-                    target=[
-                        self.hparams.text_normalizer(batch["txt_label"]).split(" ")
-                    ],
+                # Convert indices to words
+                target_words = self.tokenizer.batch_decode(
+                    tokens, skip_special_tokens=True
                 )
-                cer_stats_clean.append(
-                    ids=[batch["id"]],
-                    predict=[self.hparams.text_normalizer(result)],
-                    target=[self.hparams.text_normalizer(batch["txt_label"])],
-                )
+                if hasattr(self.hparams, "normalized_transcripts"):
+                    if hasattr(self.tokenizer, "normalize"):
+                        normalized_fn = self.tokenizer.normalize
+                    else:
+                        normalized_fn = self.tokenizer._normalize
+
+                    predicted_words = [
+                        normalized_fn(text).split(" ") for text in predicted_words
+                    ]
+
+                    target_words = [
+                        normalized_fn(text).split(" ") for text in target_words
+                    ]
+                else:
+                    predicted_words = [text.split(" ") for text in predicted_words]
+                    target_words = [text.split(" ") for text in target_words]
+
+                wer_stats_clean.append([batch["id"]], predicted_words, target_words)
+                cer_stats_clean.append([batch["id"]], predicted_words, target_words)
 
                 p1_loss_metric.append(
                     ids=[batch["id"]], predictions=emb_noisy, targets=emb_clean
                 )
 
-        import os
+        save_root = os.path.join(self.hparams.save_folder, split)
+        os.mkdir(save_root)
 
-        with open(os.path.join(self.hparams.save_folder, "p1_loss.txt"), "w") as f:
+        with open(os.path.join(save_root, "p1_loss.txt"), "w") as f:
             p1_loss_metric.write_stats(f)
 
-        with open(
-            os.path.join(self.hparams.save_folder, "wer_stats_noisy.txt"), "w"
-        ) as f:
+        with open(os.path.join(save_root, "wer_stats_noisy.txt"), "w") as f:
             wer_stats_noisy.write_stats(f)
 
-        with open(
-            os.path.join(self.hparams.save_folder, "cer_stats_noisy.txt"), "w"
-        ) as f:
+        with open(os.path.join(save_root, "cer_stats_noisy.txt"), "w") as f:
             cer_stats_noisy.write_stats(f)
 
-        with open(
-            os.path.join(self.hparams.save_folder, "wer_stats_clean.txt"), "w"
-        ) as f:
+        with open(os.path.join(save_root, "wer_stats_clean.txt"), "w") as f:
             wer_stats_clean.write_stats(f)
 
-        with open(
-            os.path.join(self.hparams.save_folder, "cer_stats_clean.txt"), "w"
-        ) as f:
+        with open(os.path.join(save_root, "cer_stats_clean.txt"), "w") as f:
             cer_stats_clean.write_stats(f)
 
 
-def dataio_prep(hparams):
+def dataio_prep(hparams, tokenizer):
     """This function prepares the datasets to be used in the brain class.
     It also defines the data processing pipeline through user-defined functions.
 
@@ -153,22 +166,14 @@ def dataio_prep(hparams):
 
     # Define audio pipeline. Adds noise, reverb, and babble on-the-fly.
     # Of course for a real enhancement dataset, you'd want a fixed valid set.
-    # @sb.utils.data_pipeline.takes(
-    #     , "txt_noisy", "txt_clean", "txt_label"
-    # )
-    # @sb.utils.data_pipeline.provides(
-    #     "emb_noisy", "emb_clean", "txt_noisy", "txt_clean", "txt_label"
-    # )
-    # def audio_pipeline(path_emb_noisy, path_emb_clean, txt_noisy, txt_clean, txt_label):
-    #     , txt_noisy, txt_clean, txt_label
 
     # 2. Define audio pipeline:
-    @sb.utils.data_pipeline.takes("path_emb_noisy", "path_emb_clean")
-    @sb.utils.data_pipeline.provides("emb_noisy", "emb_clean")
-    def audio_pipeline(path_emb_noisy, path_emb_clean):
+    @sb.utils.data_pipeline.takes("path_emb_noisy", "path_emb_clean", "wav_len")
+    @sb.utils.data_pipeline.provides("emb_noisy", "emb_clean", "wav_len")
+    def audio_pipeline(path_emb_noisy, path_emb_clean, wav_len):
         emb_noisy = torch.load(path_emb_noisy)
         emb_clean = torch.load(path_emb_clean)
-        return emb_noisy, emb_clean
+        return emb_noisy, emb_clean, wav_len
 
     # 3. Define text pipeline:
     @sb.utils.data_pipeline.takes("wrd")
@@ -206,9 +211,11 @@ def dataio_prep(hparams):
                 "id",
                 "emb_noisy",
                 "emb_clean",
-                "txt_noisy",
-                "txt_clean",
-                "txt_label",
+                "wav_len",
+                "tokens_list",
+                "tokens_bos",
+                "tokens_eos",
+                "tokens",
             ],
         )
     return datasets
@@ -244,7 +251,7 @@ if __name__ == "__main__":
             prepare_data,
             kwargs={
                 "data_folder": hparams["data_folder"],
-                "whisper_model": hparams["whisper_model"],
+                "model_id": hparams["whisper_hub"].split("/")[-1],
                 "save_json_train": hparams["train_annotation"],
                 "save_json_valid": hparams["valid_annotation"],
                 "save_json_test": hparams["test_annotation"],
@@ -263,4 +270,7 @@ if __name__ == "__main__":
         run_opts=run_opts,
     )
 
-    se_brain.transcribe_dataset(datasets[hparams["split"]])
+    se_brain.tokenizer = tokenizer
+
+    se_brain.transcribe_dataset(datasets["valid"], "valid")
+    se_brain.transcribe_dataset(datasets["test"], "test")

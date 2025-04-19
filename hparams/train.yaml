@@ -22,8 +22,8 @@ __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 # Reading data from the local disk of the compute node (e.g. $SLURM_TMPDIR with SLURM-based clusters) is very important.
 # It allows you to read the data much faster without slowing down the shared filesystem.
 data_folder: ./data
-xp_name: default
-output_folder: !ref ./results/<xp_name>
+trial_id: default
+output_folder: !ref ./results/<trial_id>
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
@@ -34,21 +34,49 @@ valid_annotation: !ref <save_folder>/valid.json
 test_annotation: !ref <save_folder>/test.json
 skip_prep: False
 
-validate_every: 10
+validate_every: 5
 
 # The train logger writes training statistics to a file, as well as stdout.
 train_logger: !new:speechbrain.utils.train_logger.WandBLogger
     initializer: !name:wandb.init
-        name: !ref <xp_name>
+        name: !ref <trial_id>
         project: otcfmasr
         dir: !ref <output_folder>/wandb
         config:
           batch_size: !ref <batch_size>
           learning_rate: !ref <learning_rate>
 
+
 # whisper settings
-text_normalizer: !new:whisper.normalizers.EnglishTextNormalizer
-whisper_model: tiny
+whisper_hub: openai/whisper-tiny
+freeze_encoder: true
+whisper_folder: !ref ./pretrained/<whisper_hub>
+sampling_rate: 16_000
+
+whisper: !new:speechbrain.lobes.models.huggingface_transformers.whisper.Whisper
+    source: !ref <whisper_hub>
+    freeze_encoder: !ref <freeze_encoder>
+    save_path: !ref <whisper_folder>
+    language: "english"
+    task: "transcribe"
+    sampling_rate: !ref <sampling_rate>
+
+# Decoding parameters
+min_decode_ratio: 0.0
+max_decode_ratio: 1.0
+test_beam_size: 8
+
+valid_search: !new:speechbrain.decoders.seq2seq.S2SWhisperGreedySearcher
+    model: !ref <whisper>
+    min_decode_ratio: !ref <min_decode_ratio>
+    max_decode_ratio: !ref <max_decode_ratio>
+
+test_search: !new:speechbrain.decoders.seq2seq.S2SWhisperBeamSearcher
+    module: [!ref <whisper>]
+    min_decode_ratio: !ref <min_decode_ratio>
+    max_decode_ratio: !ref <max_decode_ratio>
+    beam_size: !ref <test_beam_size>
+
 
 # CFM settings
 cfm_sigma: 0.1
@@ -59,22 +87,30 @@ flow_matcher: !new:torchcfm.conditional_flow_matching.ConditionalFlowMatcher
 # Training Parameters
 number_of_epochs: 20
 batch_size: 64
+batch_size_eval: 32
 learning_rate: 0.0001
 num_workers: 4
 dataloader_options:
     batch_size: !ref <batch_size>
     num_workers: !ref <num_workers>
+dataloader_options_eval:
+    batch_size: !ref <batch_size_eval>
+    num_workers: !ref <num_workers>
 
 
 # Model
+num_layers: 4
+dropout: 0.05
+attention_type: RoPEMHA
+
 model: !new:speechbrain.lobes.models.transformer.Transformer.TransformerEncoder
-    num_layers: 4
+    num_layers: !ref <num_layers>
     nhead: 6
     d_ffn: 1536
     d_model: 384
-    attention_type: RoPEMHA
+    attention_type: !ref <attention_type>
     activation: !name:torch.nn.GELU
-    dropout: 0.05
+    dropout: !ref <dropout>
 
 # metrics
 wer_stats: !new:speechbrain.utils.metric_stats.ErrorRateStats
@@ -105,3 +141,10 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     recoverables:
         model: !ref <model>
         counter: !ref <epoch_counter>
+
+ckpt_enable: true
+test: true
+
+# hopt
+hpopt_mode: null
+hpopt: null

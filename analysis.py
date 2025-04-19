@@ -70,7 +70,6 @@ def umap(emb_dir, split, aggregate="mean", N=100):
             clean_data.append(clean_emb.numpy())
             noisy_data.append(noisy_emb.numpy())
 
-    breakpoint()
     reducer = UMAP()
     if aggregate == "mean":
         umap_emb = reducer.fit_transform(np.concatenate(clean_data + noisy_data))
