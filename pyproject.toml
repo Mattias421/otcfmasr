@@ -14,5 +14,5 @@ dependencies = [
     "umap-learn>=0.5.7",
     "wandb>=0.19.9",
     "kaleido==0.2.1",
-    "orion>=0.2.7",
+    "orion[profet]>=0.2.7",
 ]
