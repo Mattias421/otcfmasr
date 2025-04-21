@@ -4,5 +4,6 @@ ckpt_enable: false
 test: false
 
 trial_id: hpopt_placeholder
-output_folder: !ref ./results/hpopt/<trial_id>
+xp_name: placeholder
+output_folder: !ref ./results/<xp_name>/<trial_id>
 

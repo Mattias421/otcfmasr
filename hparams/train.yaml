@@ -45,6 +45,11 @@ train_logger: !new:speechbrain.utils.train_logger.WandBLogger
         config:
           batch_size: !ref <batch_size>
           learning_rate: !ref <learning_rate>
+          cfm_sigma: !ref <cfm_sigma>
+          num_layers: !ref <num_layers>
+          dropout: !ref <dropout>
+          attention_type: !ref <attention_type>
+          
 
 
 # whisper settings
