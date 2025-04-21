@@ -1,4 +1,4 @@
-number_of_epochs: 1
+number_of_epochs: 20
 validate_every: 5
 ckpt_enable: false
 test: false

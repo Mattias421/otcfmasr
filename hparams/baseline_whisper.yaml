@@ -26,7 +26,7 @@ normalized_transcripts: true
 # whisper settings
 whisper_hub: openai/whisper-tiny
 freeze_encoder: true
-whisper_folder: !ref ./pretrained/<whisper_hub>
+whisper_folder: !ref ./pretrained_models/<whisper_hub>
 sampling_rate: 16_000
 
 whisper: !new:speechbrain.lobes.models.huggingface_transformers.whisper.Whisper
