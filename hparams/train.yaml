@@ -22,8 +22,9 @@ __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 # Reading data from the local disk of the compute node (e.g. $SLURM_TMPDIR with SLURM-based clusters) is very important.
 # It allows you to read the data much faster without slowing down the shared filesystem.
 data_folder: ./data
+xp_name: default
 trial_id: default
-output_folder: !ref ./results/<trial_id>
+output_folder: !ref ./results/<xp_name>/<trial_id>
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
