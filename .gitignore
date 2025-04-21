@@ -177,3 +177,4 @@ pretrained_models/
 # Me
 ################################
 .null-ls_*.py
+uv.lock
