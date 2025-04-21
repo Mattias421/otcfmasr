@@ -1,0 +1,14 @@
+number_of_epochs: 20
+validate_every: 5
+ckpt_enable: false
+test: false
+
+trial_id: hpopt_placeholder
+xp_name: placeholder
+output_folder: !ref ./results/<xp_name>/<trial_id>
+
+cfm_sigma: 'orion~choices([0.01, 0.05, 0.1, 0.2, 0.3])' 
+batch_size: 'orion~choices([16, 32, 64])'
+learning_rate: 'orion~choices([0.001, 0.005, 0.01, 0.0005])'
+dropout: 'orion~choices([0.0, 0.05, 0.1, 0.15])'
+num_layers: 'orion~choices([1, 2, 4, 6])'
