@@ -5,3 +5,7 @@ experiment:
         tpe:
             seed: 42
             n_initial_points: 5
+# storage:
+#   database:
+#     type: 'pickleddb'
+#     host: '/path/to/a/file.pkl'

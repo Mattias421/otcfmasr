@@ -5,7 +5,6 @@ from hyperpyyaml import load_hyperpyyaml
 from data_prepare import prepare_data
 
 import speechbrain as sb
-from speechbrain.utils.data_utils import undo_padding
 from speechbrain.utils import hpopt as hp
 from torchdyn.core import NeuralODE
 
@@ -84,41 +83,26 @@ class SEBrain(sb.Brain):
             hyps = predictions["hyps"]
             p1_pred = predictions["p1_pred"]
 
-            tokens, tokens_lens = batch.tokens
-            target_words = undo_padding(tokens, tokens_lens)
+            import re
 
-            # Decode token terms to words
-            predicted_words = [
-                self.tokenizer.decode(t, skip_special_tokens=True).strip() for t in hyps
-            ]
+            pattern_unwanted = r"[^{}\s]".format(
+                "".join(re.escape(c) for c in self.labels)
+            )
+            target_words = re.sub(pattern_unwanted, "", batch.wrd.upper()).split(" ")
+            target_words = [target_words]
+
+            # eval noisy
 
             # Convert indices to words
-            target_words = self.tokenizer.batch_decode(
-                target_words, skip_special_tokens=True
-            )
-            if hasattr(self.hparams, "normalized_transcripts"):
-                if hasattr(self.tokenizer, "normalize"):
-                    normalized_fn = self.tokenizer.normalize
-                else:
-                    normalized_fn = self.tokenizer._normalize
+            predicted_words = [text.split("|") for text in hyps]
 
-                predicted_words = [
-                    normalized_fn(text).split(" ") for text in predicted_words
-                ]
-
-                target_words = [normalized_fn(text).split(" ") for text in target_words]
-            else:
-                predicted_words = [text.split(" ") for text in predicted_words]
-                target_words = [text.split(" ") for text in target_words]
-
+            self.wer_stats_noisy.append([batch["id"]], predicted_words, target_words)
+            self.cer_stats_noisy.append([batch["id"]], predicted_words, target_words)
             self.p1_loss_metric.append(
                 ids=batch.id,
                 predictions=p1_pred,
                 targets=batch.emb_clean.data.to(self.device),
             )
-
-            self.wer_stats.append(batch.id, predicted_words, target_words)
-            self.cer_stats.append(batch.id, predicted_words, target_words)
 
         return cfm_loss
 
@@ -196,6 +180,19 @@ class SEBrain(sb.Brain):
                         "p1_loss": self.p1_loss_metric.summarize("average"),
                     }
                     self.hparams.valid_search.model.cpu()
+                    save_root = os.path.join(
+                        self.hparams.save_folder, "valid_stats", str(epoch)
+                    )
+                    os.makedirs(save_root, exist_ok=True)
+                    with open(os.path.join(save_root, "p1_loss.txt"), "w") as f:
+                        self.p1_loss_metric.write_stats(f)
+
+                    with open(os.path.join(save_root, "wer_stats_noisy.txt"), "w") as f:
+                        self.wer_stats.write_stats(f)
+
+                    with open(os.path.join(save_root, "cer_stats_noisy.txt"), "w") as f:
+                        self.cer_stats.write_stats(f)
+
                 else:
                     stats = {
                         "loss": stage_loss,
@@ -244,19 +241,13 @@ class SEBrain(sb.Brain):
         emb_pred = traj[-1]
         traj.cpu()
 
-        wav_lens = batch.wav_len / batch.wav_len.max()
-
-        # breakpoint()
-
-        if stage == sb.Stage.TEST:
-            hyps, _, _, _ = self.hparams.test_search(emb_pred, wav_lens)
-        else:
-            hyps, _, _, _ = self.hparams.valid_search(emb_pred, wav_lens)
+        emission = self.asr_model.aux(emb_pred)
+        hyps = [self.decoder(e) for e in emission]
 
         return hyps, emb_pred
 
 
-def dataio_prep(hparams, tokenizer):
+def dataio_prep(hparams):
     """This function prepares the datasets to be used in the brain class.
     It also defines the data processing pipeline through user-defined functions.
 
@@ -289,22 +280,9 @@ def dataio_prep(hparams, tokenizer):
 
     # 3. Define text pipeline:
     @sb.utils.data_pipeline.takes("wrd")
-    @sb.utils.data_pipeline.provides(
-        "wrd", "tokens_list", "tokens_bos", "tokens_eos", "tokens"
-    )
+    @sb.utils.data_pipeline.provides("wrd")
     def text_pipeline(wrd):
-        if "normalized_transcripts" in hparams and hparams["normalized_transcripts"]:
-            wrd = tokenizer.normalize(wrd)
         yield wrd
-        tokens_list = tokenizer.encode(wrd, add_special_tokens=False)
-        yield tokens_list
-        tokens_list = tokenizer.build_inputs_with_special_tokens(tokens_list)
-        tokens_bos = torch.LongTensor(tokens_list[:-1])
-        yield tokens_bos
-        tokens_eos = torch.LongTensor(tokens_list[1:])
-        yield tokens_eos
-        tokens = torch.LongTensor(tokens_list)
-        yield tokens
 
     # Define datasets sorted by ascending lengths for efficiency
     datasets = {}
@@ -324,10 +302,7 @@ def dataio_prep(hparams, tokenizer):
                 "emb_noisy",
                 "emb_clean",
                 "wav_len",
-                "tokens_list",
-                "tokens_bos",
-                "tokens_eos",
-                "tokens",
+                "wrd",
             ],
         )
     return datasets
@@ -371,11 +346,8 @@ if __name__ == "__main__":
                 },
             )
 
-        # Defining tokenizer and loading it
-        tokenizer = hparams["whisper"].tokenizer
-
         # Create dataset objects "train" and "valid"
-        datasets = dataio_prep(hparams, tokenizer)
+        datasets = dataio_prep(hparams)
 
         # Initialize the Brain object to prepare for mask training.
         se_brain = SEBrain(
@@ -385,7 +357,6 @@ if __name__ == "__main__":
             run_opts=run_opts,
             checkpointer=hparams["checkpointer"],
         )
-        se_brain.tokenizer = tokenizer
 
         # The `fit()` method iterates the training loop, calling the methods
         # necessary to update the parameters of the model. Since all objects

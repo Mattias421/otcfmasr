@@ -64,15 +64,17 @@ def umap(emb_dir, split, aggregate="mean", N=100):
         noisy_emb = torch.load(noisy_emb_file)
 
         if aggregate == "mean":
-            clean_data.append(clean_emb.mean(dim=1).numpy())
-            noisy_data.append(noisy_emb.mean(dim=1).numpy())
+            clean_data.append(clean_emb.mean(dim=0).numpy())
+            noisy_data.append(noisy_emb.mean(dim=0).numpy())
         else:
             clean_data.append(clean_emb.numpy())
             noisy_data.append(noisy_emb.numpy())
 
     reducer = UMAP()
     if aggregate == "mean":
-        umap_emb = reducer.fit_transform(np.concatenate(clean_data + noisy_data))
+        umap_emb = reducer.fit_transform(
+            np.concatenate(clean_data + noisy_data).reshape(N * 2, -1)
+        )
     else:
         umap_emb = reducer.fit_transform(
             np.concatenate(clean_data + noisy_data).reshape(N * 2, -1)

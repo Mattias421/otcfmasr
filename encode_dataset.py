@@ -3,17 +3,20 @@ import os
 import argparse
 from pathlib import Path
 from tqdm import tqdm
-from speechbrain.inference.ASR import EncoderDecoderASR
+from speechbrain.inference.ASR import EncoderASR
 from speechbrain.lobes.models.huggingface_transformers.whisper import Whisper
 from speechbrain.dataio.dataio import read_audio  # More robust audio reading
+
+import torchaudio
 
 # Define a mapping for common SpeechBrain ASR models
 # Add more models here as needed
 SPEECHBRAIN_MODELS = {
     "conformer-largescale": "speechbrain/asr-conformer-largescaleasr",
     "conformer-librispeech": "speechbrain/asr-conformer-transformerlm-librispeech",
-    "wav2vec2-base-960h": "speechbrain/asr-wav2vec2-commonvoice-en",
+    # "wav2vec2-base-960h": "speechbrain/asr-wav2vec2-commonvoice-en",
     "whisper-tiny": "openai/whisper-tiny",
+    "wav2vec2-asr-base-960h": "pytorch/wav2vec2-asr-base-960h",
     # Add other relevant models if desired
 }
 
@@ -41,6 +44,11 @@ def process_file(model, model_id, audio_path, output_emb_path, device):
                 mel = model._get_mel(signal)
 
                 encoder_out = model.forward_encoder(mel)
+
+            elif "pytorch" in model_id:
+                with torch.inference_mode():
+                    encoder_out, _ = model.extract_features(signal)
+                encoder_out = encoder_out[-1]
 
             else:
                 wav_lens = torch.tensor([1.0], device=device)
@@ -114,9 +122,15 @@ def get_sb_features(
             asr_model.to(device)
             asr_model.eval()  # Set model to evaluation mode
 
+        elif "pytorch" in model_id:
+            bundle = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
+            asr_model = bundle.get_model(
+                dl_kwargs={"model_dir": savedir, "file_name": model_id.split("/")[-1]}
+            ).to(device)
+
         else:
             # Load the SpeechBrain model
-            asr_model = EncoderDecoderASR.from_hparams(
+            asr_model = EncoderASR.from_hparams(
                 source=model_id,
                 savedir=f"{savedir}/{model_id}",
                 run_opts={"device": device},
