@@ -15,4 +15,5 @@ dependencies = [
     "wandb>=0.19.9",
     "kaleido==0.2.1",
     "orion[profet]>=0.2.7",
+    "matcha-tts>=0.0.7.2",
 ]

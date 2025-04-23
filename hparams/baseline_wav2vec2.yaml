@@ -8,7 +8,7 @@
 # #################################
 
 data_folder: ./data
-xp_name: baseline_default
+xp_name: baseline_wav2vec2
 output_folder: !ref ./results/<xp_name>
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt

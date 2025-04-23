@@ -47,9 +47,7 @@ train_logger: !new:speechbrain.utils.train_logger.WandBLogger
           batch_size: !ref <batch_size>
           learning_rate: !ref <learning_rate>
           cfm_sigma: !ref <cfm_sigma>
-          num_layers: !ref <num_layers>
           dropout: !ref <dropout>
-          attention_type: !ref <attention_type>
           
 
 
@@ -78,23 +76,17 @@ dataloader_options_eval:
 
 
 # Model
-num_layers: 4
 dropout: 0.05
-attention_type: RoPEMHA
 
-model: !new:speechbrain.lobes.models.transformer.Transformer.TransformerEncoder
-    num_layers: !ref <num_layers>
-    nhead: 6
-    d_ffn: 1536
-    d_model: 768
-    attention_type: !ref <attention_type>
-    activation: !name:torch.nn.GELU
+model: !new:matcha.models.components.decoder.Decoder
+    in_channels: 1536
+    out_channels: 768
     dropout: !ref <dropout>
+    n_blocks: 1
+    num_mid_blocks: 2
+    num_heads: 4
+    act_fn: snakebeta
 
-# metrics
-wer_stats: !new:speechbrain.utils.metric_stats.ErrorRateStats
-cer_stats: !new:speechbrain.utils.metric_stats.ErrorRateStats
-    split_tokens: True
 
 # The first object passed to the Brain class is this "Epoch Counter"
 # which is saved by the Checkpointer so that training can be resumed

@@ -1,4 +1,5 @@
 import sys
+import torch.nn.functional as F
 
 import torch
 from hyperpyyaml import load_hyperpyyaml
@@ -9,11 +10,38 @@ from speechbrain.utils import hpopt as hp
 from torchdyn.core import NeuralODE
 from otcfmasr.decoding import GreedyCTCDecoder
 import torchaudio
+from matcha.utils.model import sequence_mask, fix_len_compatibility
+
+
+def loss_fn(ut_pred, ut, mask):
+    loss = F.mse_loss(ut_pred, ut, reduction="sum") / (torch.sum(mask) * ut.shape[1])
+    return loss
 
 
 # Brain class for speech enhancement training
 class SEBrain(sb.Brain):
     """Class that manages the training loop. See speechbrain.core.Brain."""
+
+    def pad_and_transpose(self, batch):
+        emb_noisy = batch.emb_noisy.data.to(self.device)
+        emb_clean = batch.emb_clean.data.to(self.device)
+
+        B, L, C = emb_noisy.shape
+
+        max_length = fix_len_compatibility(
+            emb_noisy.shape[1], num_downsamplings_in_unet=2
+        )
+        lengths = batch.emb_noisy.lengths * emb_noisy.shape[1]
+        mask = sequence_mask(lengths, max_length=max_length)
+        mask = mask[:, None, :].to(self.device)
+
+        emb_noisy_input = torch.zeros((B, C, max_length)).to(self.device)
+        emb_noisy_input[:, :, :L] = emb_noisy.transpose(1, 2)
+
+        emb_clean_input = torch.zeros((B, C, max_length)).to(self.device)
+        emb_clean_input[:, :, :L] = emb_clean.transpose(1, 2)
+
+        return emb_clean_input, emb_noisy_input, mask
 
     def compute_forward(self, batch, stage):
         """Apply masking to convert from noisy waveforms to enhanced signals.
@@ -33,22 +61,30 @@ class SEBrain(sb.Brain):
         # We first move the batch to the appropriate device, and
         # compute the features necessary for masking.
 
-        emb_noisy = batch.emb_noisy.data.to(self.device)
-        emb_clean = batch.emb_clean.data.to(self.device)
+        emb_noisy, emb_clean, mask = self.pad_and_transpose(batch)
 
         t, xt, ut = self.hparams.flow_matcher.sample_location_and_conditional_flow(
             emb_noisy, emb_clean
         )
 
-        ut_pred, _ = self.modules.model(xt)
+        xt = xt * mask
+        ut = ut * mask
+
+        ut_pred = self.modules.model(xt, mask, emb_noisy, t)
 
         if (
             stage == sb.Stage.VALID and self.epoch % self.hparams.validate_every == 0
         ) or stage == sb.Stage.TEST:
             hyps, p1_pred = self.inference(batch, stage)
-            return {"ut": ut, "ut_pred": ut_pred, "hyps": hyps, "p1_pred": p1_pred}
+            return {
+                "ut": ut,
+                "ut_pred": ut_pred,
+                "hyps": hyps,
+                "p1_pred": p1_pred,
+                "mask": mask,
+            }
         else:
-            return {"ut": ut, "ut_pred": ut_pred}
+            return {"ut": ut, "ut_pred": ut_pred, "mask": mask}
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given the predicted and targeted outputs.
@@ -67,12 +103,16 @@ class SEBrain(sb.Brain):
         loss : torch.Tensor
             A one-element tensor used for backpropagating the gradient.
         """
-        cfm_loss = torch.mean((predictions["ut_pred"] - predictions["ut"]) ** 2)
+
+        cfm_loss = loss_fn(
+            predictions["ut_pred"], predictions["ut"], predictions["mask"]
+        )
 
         self.loss_metric.append(
             ids=batch.id,
-            predictions=predictions["ut_pred"],
-            targets=predictions["ut"],
+            ut_pred=predictions["ut_pred"],
+            ut=predictions["ut"],
+            mask=predictions["mask"],
         )
 
         # Some evaluations are slower, and we only want to perform them
@@ -83,7 +123,6 @@ class SEBrain(sb.Brain):
             txt_hyp, p1_pred_batch = self.inference(batch)
 
             hyps = predictions["hyps"]
-            p1_pred = predictions["p1_pred"]
 
             import re
 
@@ -103,10 +142,11 @@ class SEBrain(sb.Brain):
 
             self.wer_stats.append(batch.id, predicted_words, target_words)
             self.cer_stats.append(batch.id, predicted_words, target_words)
+
+            emb_noisy, emb_clean, mask = self.pad_and_transpose(batch)
+
             self.p1_loss_metric.append(
-                ids=batch.id,
-                predictions=p1_pred,
-                targets=batch.emb_clean.data.to(self.device),
+                ids=batch.id, ut_pred=predictions["p1_pred"], ut=emb_clean, mask=mask
             )
 
         return cfm_loss
@@ -124,9 +164,7 @@ class SEBrain(sb.Brain):
         """
         # Set up statistics trackers for this stage
         self.loss_metric = sb.utils.metric_stats.MetricStats(
-            metric=lambda predictions, targets: torch.mean(
-                (predictions - targets) ** 2
-            )[None]
+            metric=lambda ut_pred, ut, mask: loss_fn(ut_pred, ut, mask)[None]
         )
 
         self.epoch = epoch
@@ -139,9 +177,7 @@ class SEBrain(sb.Brain):
                 self.cer_stats = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
 
                 self.p1_loss_metric = sb.utils.metric_stats.MetricStats(
-                    metric=lambda predictions, targets: torch.mean(
-                        (predictions - targets) ** 2
-                    )[None]
+                    metric=lambda ut_pred, ut, mask: loss_fn(ut_pred, ut, mask)[None]
                 )
 
         elif stage == sb.Stage.TEST:
@@ -151,9 +187,7 @@ class SEBrain(sb.Brain):
             self.cer_stats = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
 
             self.p1_loss_metric = sb.utils.metric_stats.MetricStats(
-                metric=lambda predictions, targets: torch.mean(
-                    (predictions - targets) ** 2
-                )[None]
+                metric=lambda ut_pred, ut, mask: loss_fn(ut_pred, ut, mask)[None]
             )
 
     def on_stage_end(self, stage, stage_loss, epoch=None):
@@ -190,10 +224,10 @@ class SEBrain(sb.Brain):
                     with open(os.path.join(save_root, "p1_loss.txt"), "w") as f:
                         self.p1_loss_metric.write_stats(f)
 
-                    with open(os.path.join(save_root, "wer_stats_noisy.txt"), "w") as f:
+                    with open(os.path.join(save_root, "wer_stats.txt"), "w") as f:
                         self.wer_stats.write_stats(f)
 
-                    with open(os.path.join(save_root, "cer_stats_noisy.txt"), "w") as f:
+                    with open(os.path.join(save_root, "cer_stats.txt"), "w") as f:
                         self.cer_stats.write_stats(f)
 
                 else:
@@ -233,11 +267,12 @@ class SEBrain(sb.Brain):
 
     @torch.no_grad
     def inference(self, batch, stage=None):
-        emb_noisy = batch.emb_noisy.data.to(self.device)
+        emb_noisy, emb_clean, mask = self.pad_and_transpose(batch)
 
         def vt(t, x, args):
-            model_out, _ = self.modules.model(x)
-            return model_out
+            x = x * mask
+            ut_pred = self.modules.model(x, mask, emb_noisy, t)
+            return ut_pred * mask
 
         node = NeuralODE(vt, solver="euler", sensitivity="adjoint")
         traj = node.trajectory(emb_noisy, t_span=torch.linspace(0, 1, 50))
@@ -245,10 +280,14 @@ class SEBrain(sb.Brain):
         emb_pred = traj[-1]
         traj.cpu()
 
+        p1_pred = emb_pred  # save for loss stats
+
+        emb_pred = emb_pred[:, :, : mask.sum(dim=-1).max()].transpose(1, 2)
+
         emission = self.asr_model.aux(emb_pred)
         hyps = [self.decoder(e) for e in emission]
 
-        return hyps, emb_pred
+        return hyps, p1_pred
 
 
 def dataio_prep(hparams):
