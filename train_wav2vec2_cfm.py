@@ -7,6 +7,8 @@ from data_prepare import prepare_data
 import speechbrain as sb
 from speechbrain.utils import hpopt as hp
 from torchdyn.core import NeuralODE
+from otcfmasr.decoding import GreedyCTCDecoder
+import torchaudio
 
 
 # Brain class for speech enhancement training
@@ -88,16 +90,19 @@ class SEBrain(sb.Brain):
             pattern_unwanted = r"[^{}\s]".format(
                 "".join(re.escape(c) for c in self.labels)
             )
-            target_words = re.sub(pattern_unwanted, "", batch.wrd.upper()).split(" ")
-            target_words = [target_words]
+            target_words = [
+                re.sub(pattern_unwanted, "", wrd.upper()).split(" ")
+                for wrd in batch.wrd
+            ]
+            target_words = target_words
 
             # eval noisy
 
             # Convert indices to words
             predicted_words = [text.split("|") for text in hyps]
 
-            self.wer_stats_noisy.append([batch["id"]], predicted_words, target_words)
-            self.cer_stats_noisy.append([batch["id"]], predicted_words, target_words)
+            self.wer_stats.append(batch.id, predicted_words, target_words)
+            self.cer_stats.append(batch.id, predicted_words, target_words)
             self.p1_loss_metric.append(
                 ids=batch.id,
                 predictions=p1_pred,
@@ -129,6 +134,7 @@ class SEBrain(sb.Brain):
         # Set up evaluation-only statistics trackers
         if stage == sb.Stage.VALID:
             if epoch % self.hparams.validate_every == 0:
+                self.asr_model.aux.to(self.device)
                 self.wer_stats = sb.utils.metric_stats.ErrorRateStats()
                 self.cer_stats = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
 
@@ -137,9 +143,9 @@ class SEBrain(sb.Brain):
                         (predictions - targets) ** 2
                     )[None]
                 )
-                self.hparams.valid_search.model.to(self.device)
 
         elif stage == sb.Stage.TEST:
+            self.asr_model.aux.to(self.device)
             self.epoch = self.hparams.validate_every
             self.wer_stats = sb.utils.metric_stats.ErrorRateStats()
             self.cer_stats = sb.utils.metric_stats.ErrorRateStats(split_tokens=True)
@@ -149,8 +155,6 @@ class SEBrain(sb.Brain):
                     (predictions - targets) ** 2
                 )[None]
             )
-
-            self.hparams.test_search.model.to(self.device)
 
     def on_stage_end(self, stage, stage_loss, epoch=None):
         """Gets called at the end of an epoch.
@@ -179,7 +183,6 @@ class SEBrain(sb.Brain):
                         "cer": self.cer_stats.summarize("WER"),
                         "p1_loss": self.p1_loss_metric.summarize("average"),
                     }
-                    self.hparams.valid_search.model.cpu()
                     save_root = os.path.join(
                         self.hparams.save_folder, "valid_stats", str(epoch)
                     )
@@ -218,6 +221,7 @@ class SEBrain(sb.Brain):
                 self.checkpointer.save_and_keep_only(meta=stats, min_keys=["wer"])
 
             hp.report_result(stats)
+            self.asr_model.aux.cpu()
 
         # We also write statistics about test data to stdout and to the logfile.
         if stage == sb.Stage.TEST:
@@ -225,7 +229,7 @@ class SEBrain(sb.Brain):
                 {"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stats,
             )
-            self.hparams.test_search.model.cpu()
+            self.asr_model.aux.cpu()
 
     @torch.no_grad
     def inference(self, batch, stage=None):
@@ -339,7 +343,7 @@ if __name__ == "__main__":
                 prepare_data,
                 kwargs={
                     "data_folder": hparams["data_folder"],
-                    "model_id": hparams["whisper_hub"].split("/")[-1],
+                    "model_id": hparams["model_id"],
                     "save_json_train": hparams["train_annotation"],
                     "save_json_valid": hparams["valid_annotation"],
                     "save_json_test": hparams["test_annotation"],
@@ -357,6 +361,20 @@ if __name__ == "__main__":
             run_opts=run_opts,
             checkpointer=hparams["checkpointer"],
         )
+
+        # prepare asr model
+        bundle = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
+        decoder = GreedyCTCDecoder(labels=bundle.get_labels())
+        model = bundle.get_model(
+            dl_kwargs={
+                "model_dir": hparams["model_dir"],
+                "file_name": hparams["model_id"],
+            }
+        )
+
+        se_brain.decoder = decoder
+        se_brain.asr_model = model
+        se_brain.labels = bundle.get_labels()
 
         # The `fit()` method iterates the training loop, calling the methods
         # necessary to update the parameters of the model. Since all objects
