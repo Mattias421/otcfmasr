@@ -37,6 +37,9 @@ skip_prep: False
 
 validate_every: 5
 
+pairing_mode: paired
+pad: true
+
 # The train logger writes training statistics to a file, as well as stdout.
 train_logger: !new:speechbrain.utils.train_logger.WandBLogger
     initializer: !name:wandb.init
@@ -59,6 +62,12 @@ model_dir: !ref ./pretrained_models
 cfm_sigma: 0.1
 flow_matcher: !new:torchcfm.conditional_flow_matching.ConditionalFlowMatcher
     sigma: !ref <cfm_sigma>
+
+ot_sampler: !new:torchcfm.optimal_transport.OTPlanSampler
+    method: exact
+
+ot_replace: False
+otcfm: False # set true for ot minibatches
 
 
 # Training Parameters

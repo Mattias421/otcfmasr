@@ -147,73 +147,123 @@ def get_sb_features(
         print(f"Attempted to load from: {model_id}")
         return
 
-    # --- Define dataset structure ---
-    # Adjust splits/conditions if your dataset differs
-    splits = ["train", "test", "valid"]
-    conditions = ["noisy", "clean"]
-    # --- ---
+    if input_dir.split("/")[-2] == "VB+DMD":
+        # --- Define dataset structure ---
+        # Adjust splits/conditions if your dataset differs
+        splits = ["train", "test", "valid"]
+        conditions = ["noisy", "clean"]
+        # --- ---
 
-    print(f"Starting processing from: {input_base}")
-    print(f"Output will be saved to: {output_base}")
+        print(f"Starting processing from: {input_base}")
+        print(f"Output will be saved to: {output_base}")
 
-    total_files_processed = 0
-    total_files_skipped = 0
-    total_errors = 0
+        total_files_processed = 0
+        total_files_skipped = 0
+        total_errors = 0
 
-    for split in splits:
-        for condition in conditions:
-            current_input_dir = input_base / split / condition
-            current_output_emb_dir = output_emb_dir / split / condition
+        for split in splits:
+            for condition in conditions:
+                current_input_dir = input_base / split / condition
+                current_output_emb_dir = output_emb_dir / split / condition
 
-            if not current_input_dir.is_dir():
-                print(f"Warning: Directory not found, skipping: {current_input_dir}")
-                continue
-
-            print(f"\nProcessing: {split}/{condition}")
-
-            # Find all .wav files (adjust glob pattern if needed)
-            wav_files = sorted(list(current_input_dir.glob("*.wav")))
-            if not wav_files:
-                print(f"No .wav files found in {current_input_dir}")
-                continue
-
-            # Create output directories for the current subset
-            current_output_emb_dir.mkdir(parents=True, exist_ok=True)
-
-            progress_bar = tqdm(
-                wav_files, desc=f"{split}/{condition}", unit="file", leave=False
-            )
-            for wav_path in progress_bar:
-                file_stem = wav_path.stem
-                output_emb_path = current_output_emb_dir / f"{file_stem}.pt"
-
-                if not force_overwrite and output_emb_path.exists():
-                    total_files_skipped += 1
+                if not current_input_dir.is_dir():
+                    print(
+                        f"Warning: Directory not found, skipping: {current_input_dir}"
+                    )
                     continue
 
-                progress_bar.set_postfix_str(
-                    f"Processing {wav_path.name}", refresh=True
+                print(f"\nProcessing: {split}/{condition}")
+
+                # Find all .wav files (adjust glob pattern if needed)
+                wav_files = sorted(list(current_input_dir.glob("*.wav")))
+                if not wav_files:
+                    print(f"No .wav files found in {current_input_dir}")
+                    continue
+
+                # Create output directories for the current subset
+                current_output_emb_dir.mkdir(parents=True, exist_ok=True)
+
+                progress_bar = tqdm(
+                    wav_files, desc=f"{split}/{condition}", unit="file", leave=False
                 )
+                for wav_path in progress_bar:
+                    file_stem = wav_path.stem
+                    output_emb_path = current_output_emb_dir / f"{file_stem}.pt"
 
-                success = process_file(
-                    asr_model,  # Pass the SpeechBrain model
-                    model_id,
-                    str(wav_path),
-                    str(output_emb_path),
-                    device,  # Pass the determined device
-                )
+                    if not force_overwrite and output_emb_path.exists():
+                        total_files_skipped += 1
+                        continue
 
-                if success:
-                    total_files_processed += 1
-                else:
-                    total_errors += 1
-                    # Optionally add a small delay or break on too many errors
-                    # import time; time.sleep(0.1)
+                    progress_bar.set_postfix_str(
+                        f"Processing {wav_path.name}", refresh=True
+                    )
 
-                # Clear postfix for cleaner progress bar
-                progress_bar.set_postfix_str("", refresh=True)
-            progress_bar.close()
+                    success = process_file(
+                        asr_model,  # Pass the SpeechBrain model
+                        model_id,
+                        str(wav_path),
+                        str(output_emb_path),
+                        device,  # Pass the determined device
+                    )
 
+                    if success:
+                        total_files_processed += 1
+                    else:
+                        total_errors += 1
+                        # Optionally add a small delay or break on too many errors
+                        # import time; time.sleep(0.1)
+
+                    # Clear postfix for cleaner progress bar
+                    progress_bar.set_postfix_str("", refresh=True)
+                progress_bar.close()
+
+    elif input_dir.split("/")[-2] == "LJSpeech-1.1":
+        total_files_processed = 0
+        total_files_skipped = 0
+        total_errors = 0
+
+        current_input_dir = input_base / "wavs"
+        current_output_emb_dir = output_emb_dir
+
+        print("\nProcessing:LJSpeech")
+
+        # Find all .wav files (adjust glob pattern if needed)
+        wav_files = sorted(list(current_input_dir.glob("*.wav")))
+
+        # Create output directories for the current subset
+        current_output_emb_dir.mkdir(parents=True, exist_ok=True)
+
+        progress_bar = tqdm(wav_files, desc="LJSpeech", unit="file", leave=False)
+        for wav_path in progress_bar:
+            file_stem = wav_path.stem
+            output_emb_path = current_output_emb_dir / f"{file_stem}.pt"
+
+            if not force_overwrite and output_emb_path.exists():
+                total_files_skipped += 1
+                continue
+
+            progress_bar.set_postfix_str(f"Processing {wav_path.name}", refresh=True)
+
+            success = process_file(
+                asr_model,  # Pass the SpeechBrain model
+                model_id,
+                str(wav_path),
+                str(output_emb_path),
+                device,  # Pass the determined device
+            )
+
+            if success:
+                total_files_processed += 1
+            else:
+                total_errors += 1
+                # Optionally add a small delay or break on too many errors
+                # import time; time.sleep(0.1)
+
+            # Clear postfix for cleaner progress bar
+            progress_bar.set_postfix_str("", refresh=True)
+        progress_bar.close()
+
+    breakpoint()
     print("\n--------------------")
     print("Processing Summary:")
     print(f"  Model Used: {model_id}")

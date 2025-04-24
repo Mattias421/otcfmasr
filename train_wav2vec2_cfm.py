@@ -28,18 +28,34 @@ class SEBrain(sb.Brain):
 
         B, L, C = emb_noisy.shape
 
-        max_length = fix_len_compatibility(
-            emb_noisy.shape[1], num_downsamplings_in_unet=2
-        )
-        lengths = batch.emb_noisy.lengths * emb_noisy.shape[1]
+        # if not pad, cut
+        if self.hparams.pad:
+            L = L if L > emb_clean.shape[1] else emb_clean.shape[1]
+        else:
+            L = L if L < emb_clean.shape[1] else emb_clean.shape[1]
+
+        max_length = fix_len_compatibility(L, num_downsamplings_in_unet=2)
+        lengths_noisy = batch.emb_noisy.lengths * emb_noisy.shape[1]
+        lengths_clean = batch.emb_clean.lengths * emb_clean.shape[1]
+
+        if self.hparams.pad:
+            lengths = torch.maximum(lengths_noisy, lengths_clean)
+        else:
+            lengths = torch.minimum(lengths_noisy, lengths_clean)
+
         mask = sequence_mask(lengths, max_length=max_length)
         mask = mask[:, None, :].to(self.device)
 
         emb_noisy_input = torch.zeros((B, C, max_length)).to(self.device)
-        emb_noisy_input[:, :, :L] = emb_noisy.transpose(1, 2)
 
         emb_clean_input = torch.zeros((B, C, max_length)).to(self.device)
-        emb_clean_input[:, :, :L] = emb_clean.transpose(1, 2)
+
+        if self.hparams.pad:
+            emb_noisy_input[:, :, : emb_noisy.shape[1]] = emb_noisy.transpose(1, 2)
+            emb_clean_input[:, :, : emb_clean.shape[1]] = emb_clean.transpose(1, 2)
+        else:
+            emb_noisy_input[:, :, :L] = emb_noisy.transpose(1, 2)[:, :, :L]
+            emb_clean_input[:, :, :L] = emb_clean.transpose(1, 2)[:, :, :L]
 
         return emb_clean_input, emb_noisy_input, mask
 
@@ -62,6 +78,27 @@ class SEBrain(sb.Brain):
         # compute the features necessary for masking.
 
         emb_noisy, emb_clean, mask = self.pad_and_transpose(batch)
+
+        if self.hparams.otcfm:
+            emb_noisy_agg = (
+                batch.emb_noisy.data.sum(dim=1)
+                / (batch.emb_noisy.lengths * emb_noisy.shape[1])[:, None]
+            )
+            emb_clean_agg = (
+                batch.emb_clean.data.sum(dim=1)
+                / (batch.emb_clean.lengths * emb_clean.shape[1])[:, None]
+            )
+
+            _, _, label_x, label_y = self.hparams.ot_sampler.sample_plan_with_labels(
+                emb_noisy_agg,
+                emb_clean_agg,
+                torch.arange(self.hparams.batch_size),
+                torch.arange(self.hparams.batch_size),
+                replace=self.hparams.ot_replace,
+            )
+
+            emb_noisy = emb_noisy[label_x]
+            emb_clean = emb_clean[label_y]
 
         t, xt, ut = self.hparams.flow_matcher.sample_location_and_conditional_flow(
             emb_noisy, emb_clean
@@ -238,7 +275,20 @@ class SEBrain(sb.Brain):
             else:
                 stats = {
                     "loss": stage_loss,
+                    "wer": self.wer_stats.summarize("WER"),
+                    "cer": self.cer_stats.summarize("WER"),
+                    "p1_loss": self.p1_loss_metric.summarize("average"),
                 }
+                save_root = os.path.join(self.hparams.save_folder, "test_stats")
+                os.makedirs(save_root, exist_ok=True)
+                with open(os.path.join(save_root, "p1_loss.txt"), "w") as f:
+                    self.p1_loss_metric.write_stats(f)
+
+                with open(os.path.join(save_root, "wer_stats.txt"), "w") as f:
+                    self.wer_stats.write_stats(f)
+
+                with open(os.path.join(save_root, "cer_stats.txt"), "w") as f:
+                    self.cer_stats.write_stats(f)
 
         # At the end of validation, we can write stats and checkpoints
         if stage == sb.Stage.VALID:
@@ -264,9 +314,15 @@ class SEBrain(sb.Brain):
                 test_stats=stats,
             )
             self.asr_model.aux.cpu()
+            print(f"Final stats are {stats}")
+            hp.report_result(stats)
 
     @torch.no_grad
     def inference(self, batch, stage=None):
+        # make emb_clean same as noisy for correct mask
+        # batch_infer = batch
+        # batch_infer.emb_clean = batch_infer.emb_noisy
+        # emb_noisy, emb_clean, mask = self.pad_and_transpose(batch_infer)
         emb_noisy, emb_clean, mask = self.pad_and_transpose(batch)
 
         def vt(t, x, args):
@@ -386,6 +442,7 @@ if __name__ == "__main__":
                     "save_json_train": hparams["train_annotation"],
                     "save_json_valid": hparams["valid_annotation"],
                     "save_json_test": hparams["test_annotation"],
+                    "pairing_mode": hparams["pairing_mode"],
                 },
             )
 
