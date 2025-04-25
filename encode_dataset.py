@@ -5,7 +5,6 @@ from pathlib import Path
 from tqdm import tqdm
 from speechbrain.inference.ASR import EncoderASR
 from speechbrain.lobes.models.huggingface_transformers.whisper import Whisper
-from speechbrain.dataio.dataio import read_audio  # More robust audio reading
 
 import torchaudio
 
@@ -21,7 +20,9 @@ SPEECHBRAIN_MODELS = {
 }
 
 
-def process_file(model, model_id, audio_path, output_emb_path, device):
+def process_file(
+    model, model_id, audio_path, output_emb_path, device, target_sample_rate=16000
+):
     """
     Processes a single audio file to extract SpeechBrain encoder embedding and transcription.
 
@@ -33,7 +34,7 @@ def process_file(model, model_id, audio_path, output_emb_path, device):
         device (str): The device to use ('cuda' or 'cpu').
     """
     try:
-        signal = read_audio(audio_path)
+        signal, sample_rate = torchaudio.load(audio_path)
         # Ensure signal is 2D [batch, time] as encode_batch expects batch dim
         if signal.ndim == 1:
             signal = signal.unsqueeze(0)
@@ -46,6 +47,9 @@ def process_file(model, model_id, audio_path, output_emb_path, device):
                 encoder_out = model.forward_encoder(mel)
 
             elif "pytorch" in model_id:
+                signal = torchaudio.functional.resample(
+                    signal, sample_rate, target_sample_rate
+                )
                 with torch.inference_mode():
                     encoder_out, _ = model.extract_features(signal)
                 encoder_out = encoder_out[-1]
@@ -127,6 +131,7 @@ def get_sb_features(
             asr_model = bundle.get_model(
                 dl_kwargs={"model_dir": savedir, "file_name": model_id.split("/")[-1]}
             ).to(device)
+            target_sample_rate = bundle.sample_rate
 
         else:
             # Load the SpeechBrain model
@@ -250,6 +255,7 @@ def get_sb_features(
                 str(wav_path),
                 str(output_emb_path),
                 device,  # Pass the determined device
+                target_sample_rate,
             )
 
             if success:
@@ -263,7 +269,6 @@ def get_sb_features(
             progress_bar.set_postfix_str("", refresh=True)
         progress_bar.close()
 
-    breakpoint()
     print("\n--------------------")
     print("Processing Summary:")
     print(f"  Model Used: {model_id}")

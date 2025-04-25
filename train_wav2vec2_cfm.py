@@ -1,3 +1,4 @@
+import re
 import sys
 import torch.nn.functional as F
 
@@ -11,6 +12,7 @@ from torchdyn.core import NeuralODE
 from otcfmasr.decoding import GreedyCTCDecoder
 import torchaudio
 from matcha.utils.model import sequence_mask, fix_len_compatibility
+import random
 
 
 def loss_fn(ut_pred, ut, mask):
@@ -22,40 +24,219 @@ def loss_fn(ut_pred, ut, mask):
 class SEBrain(sb.Brain):
     """Class that manages the training loop. See speechbrain.core.Brain."""
 
-    def pad_and_transpose(self, batch):
-        emb_noisy = batch.emb_noisy.data.to(self.device)
-        emb_clean = batch.emb_clean.data.to(self.device)
+    # def pad_and_transpose(self, batch):
+    #     emb_noisy = batch.emb_noisy.data.to(self.device)
+    #     emb_clean = batch.emb_clean.data.to(self.device)
+    #
+    #     B, L, C = emb_noisy.shape
+    #
+    #     # if not pad, cut
+    #     if self.hparams.pad:
+    #         L = L if L > emb_clean.shape[1] else emb_clean.shape[1]
+    #     else:
+    #         L = L if L < emb_clean.shape[1] else emb_clean.shape[1]
+    #
+    #     max_length = fix_len_compatibility(L, num_downsamplings_in_unet=2)
+    #     lengths_noisy = batch.emb_noisy.lengths * emb_noisy.shape[1]
+    #     lengths_clean = batch.emb_clean.lengths * emb_clean.shape[1]
+    #
+    #     if self.hparams.pad:
+    #         lengths = torch.maximum(lengths_noisy, lengths_clean)
+    #     else:
+    #         lengths = torch.minimum(lengths_noisy, lengths_clean)
+    #
+    #     mask = sequence_mask(lengths, max_length=max_length)
+    #     mask = mask[:, None, :].to(self.device)
+    #
+    #     emb_noisy_input = torch.zeros((B, C, max_length)).to(self.device)
+    #
+    #     emb_clean_input = torch.zeros((B, C, max_length)).to(self.device)
+    #
+    #     if self.hparams.pad:
+    #         emb_noisy_input[:, :, : emb_noisy.shape[1]] = emb_noisy.transpose(1, 2)
+    #         emb_clean_input[:, :, : emb_clean.shape[1]] = emb_clean.transpose(1, 2)
+    #     else:
+    #         emb_noisy_input[:, :, :L] = emb_noisy.transpose(1, 2)[:, :, :L]
+    #         emb_clean_input[:, :, :L] = emb_clean.transpose(1, 2)[:, :, :L]
+    #
+    #     return emb_clean_input, emb_noisy_input, mask
 
-        B, L, C = emb_noisy.shape
+    def pad_and_transpose(self, batch, cut_segments=False):
+        """
+        Prepares noisy and clean embeddings for the model.
 
-        # if not pad, cut
-        if self.hparams.pad:
-            L = L if L > emb_clean.shape[1] else emb_clean.shape[1]
+        Handles optional segment cutting, padding/truncation, and transposing.
+
+        Arguments:
+        ----------
+        batch : PaddedBatch
+            Must contain 'emb_noisy' and 'emb_clean' PaddedData fields.
+
+        Returns:
+        --------
+        emb_clean_input : torch.Tensor
+            Processed clean embeddings (B, C, L_out).
+        emb_noisy_input : torch.Tensor
+            Processed noisy embeddings (B, C, L_out).
+        mask : torch.Tensor
+            Boolean mask for the processed length (B, 1, L_out).
+        """
+        # 1. Get raw data and absolute lengths
+        # Assuming batch.emb_*.data is shape (B, L_padded, C)
+        # Assuming batch.emb_*.lengths is relative (0.0 to 1.0)
+        emb_noisy_data = batch.emb_noisy.data.to(self.device)
+        emb_clean_data = batch.emb_clean.data.to(self.device)
+        B, L_noisy_padded, C = emb_noisy_data.shape
+        _, L_clean_padded, _ = emb_clean_data.shape
+
+        # Calculate absolute lengths in frames
+        lengths_noisy_abs = torch.round(batch.emb_noisy.lengths * L_noisy_padded).int()
+        lengths_clean_abs = torch.round(batch.emb_clean.lengths * L_clean_padded).int()
+
+        # --- Branch based on whether segment cutting is enabled ---
+        if cut_segments:
+            segment_length = self.hparams.segment_length
+            num_downsamplings = getattr(
+                self.hparams, "num_downsamplings_in_unet", 2
+            )  # Get from hparams or use default
+            final_segment_length = fix_len_compatibility(
+                segment_length, num_downsamplings
+            )
+
+            # Determine lengths to base the cut on (use minimum actual length)
+            cut_base_lengths = torch.minimum(lengths_noisy_abs, lengths_clean_abs).to(
+                self.device
+            )
+
+            # Calculate max offset for random start point
+            # Ensure offset doesn't go past the possible start for a full segment
+            max_offset = (cut_base_lengths - segment_length).clamp(min=0)
+
+            # Generate random offsets for each batch item
+            offset_ranges = list(
+                zip([0] * B, max_offset.cpu().numpy())
+            )  # Use cpu for range
+            out_offset = torch.LongTensor(
+                # random.choice picks from range(start, end). If end=start, range is empty.
+                # Need range(start, end + 1) if end is inclusive, or handle end=start.
+                [
+                    random.choice(range(start, end + 1)) if end >= start else 0
+                    for start, end in offset_ranges
+                ]
+            ).to(self.device)
+
+            # Initialize tensors for cut segments (B, C, final_segment_length)
+            # Note: We transpose *before* cutting for potential efficiency if C << L
+            emb_noisy_data_t = emb_noisy_data.transpose(1, 2)  # (B, C, L_padded)
+            emb_clean_data_t = emb_clean_data.transpose(1, 2)  # (B, C, L_padded)
+
+            emb_noisy_cut = torch.zeros(
+                (B, C, final_segment_length),
+                dtype=emb_noisy_data_t.dtype,
+                device=self.device,
+            )
+            emb_clean_cut = torch.zeros(
+                (B, C, final_segment_length),
+                dtype=emb_clean_data_t.dtype,
+                device=self.device,
+            )
+
+            # Calculate the actual length of the segment that will be cut for each item
+            # min(desired_length, available_length_from_offset)
+            actual_cut_lengths = torch.minimum(
+                torch.full_like(cut_base_lengths, segment_length),  # Desired length
+                cut_base_lengths - out_offset,  # Available length
+            ).clamp(min=0)  # Ensure non-negative length
+
+            # Loop through batch and copy segments
+            for i in range(B):
+                start_idx = out_offset[i]
+                length_to_copy = actual_cut_lengths[i].item()  # Use item() for scalar
+                end_idx = start_idx + length_to_copy
+
+                if length_to_copy > 0:
+                    # Copy the slice into the target tensor, up to final_segment_length
+                    emb_noisy_cut[i, :, :length_to_copy] = emb_noisy_data_t[
+                        i, :, start_idx:end_idx
+                    ]
+                    emb_clean_cut[i, :, :length_to_copy] = emb_clean_data_t[
+                        i, :, start_idx:end_idx
+                    ]
+
+            # Final outputs are the cut tensors
+            emb_noisy_input = emb_noisy_cut
+            emb_clean_input = emb_clean_cut
+            # Lengths for the mask are the lengths of the segments actually copied
+            final_lengths = actual_cut_lengths
+            max_length_for_mask = final_segment_length  # Mask uses the padded length
+
+        # --- Original Padding/Truncating Logic (if not cutting segments) ---
         else:
-            L = L if L < emb_clean.shape[1] else emb_clean.shape[1]
+            num_downsamplings = getattr(
+                self.hparams, "num_downsamplings_in_unet", 2
+            )  # Get from hparams or use default
 
-        max_length = fix_len_compatibility(L, num_downsamplings_in_unet=2)
-        lengths_noisy = batch.emb_noisy.lengths * emb_noisy.shape[1]
-        lengths_clean = batch.emb_clean.lengths * emb_clean.shape[1]
+            # Determine target length L based on padding preference and actual lengths
+            if self.hparams.pad:
+                # Pad: use the maximum actual length observed in the batch
+                L = torch.maximum(lengths_noisy_abs, lengths_clean_abs).max().item()
+            else:
+                # Cut/Truncate: use the minimum actual length observed in the batch
+                L = torch.minimum(lengths_noisy_abs, lengths_clean_abs).min().item()
+                # Note: This interpretation differs slightly from your original snippet's
+                # comparison of padded lengths, but seems more robust.
 
-        if self.hparams.pad:
-            lengths = torch.maximum(lengths_noisy, lengths_clean)
-        else:
-            lengths = torch.minimum(lengths_noisy, lengths_clean)
+            # Make target length compatible with model architecture (e.g., U-Net)
+            max_length = fix_len_compatibility(L, num_downsamplings)
 
-        mask = sequence_mask(lengths, max_length=max_length)
-        mask = mask[:, None, :].to(self.device)
+            # Determine final lengths for the mask based on padding/truncation choice
+            if self.hparams.pad:
+                # If padding, final length is the max original length (up to max_length)
+                final_lengths = torch.maximum(
+                    lengths_noisy_abs, lengths_clean_abs
+                ).clamp(max=max_length)
+            else:
+                # If truncating, final length is the min original length (up to max_length)
+                final_lengths = torch.minimum(
+                    lengths_noisy_abs, lengths_clean_abs
+                ).clamp(max=max_length)
 
-        emb_noisy_input = torch.zeros((B, C, max_length)).to(self.device)
+            # Initialize output tensors (B, C, max_length)
+            emb_noisy_input = torch.zeros(
+                (B, C, max_length), dtype=emb_noisy_data.dtype, device=self.device
+            )
+            emb_clean_input = torch.zeros(
+                (B, C, max_length), dtype=emb_clean_data.dtype, device=self.device
+            )
 
-        emb_clean_input = torch.zeros((B, C, max_length)).to(self.device)
+            # Transpose originals for easier slicing (B, C, L_padded)
+            emb_noisy_data_t = emb_noisy_data.transpose(1, 2)
+            emb_clean_data_t = emb_clean_data.transpose(1, 2)
 
-        if self.hparams.pad:
-            emb_noisy_input[:, :, : emb_noisy.shape[1]] = emb_noisy.transpose(1, 2)
-            emb_clean_input[:, :, : emb_clean.shape[1]] = emb_clean.transpose(1, 2)
-        else:
-            emb_noisy_input[:, :, :L] = emb_noisy.transpose(1, 2)[:, :, :L]
-            emb_clean_input[:, :, :L] = emb_clean.transpose(1, 2)[:, :, :L]
+            # Loop and copy data, applying padding or truncation implicitly
+            for i in range(B):
+                # Determine length to copy for this item (min of its actual length and max_length)
+                len_noisy_copy = min(lengths_noisy_abs[i].item(), max_length)
+                len_clean_copy = min(lengths_clean_abs[i].item(), max_length)
+
+                # Copy the data
+                if len_noisy_copy > 0:
+                    emb_noisy_input[i, :, :len_noisy_copy] = emb_noisy_data_t[
+                        i, :, :len_noisy_copy
+                    ]
+                if len_clean_copy > 0:
+                    emb_clean_input[i, :, :len_clean_copy] = emb_clean_data_t[
+                        i, :, :len_clean_copy
+                    ]
+
+            max_length_for_mask = max_length  # Mask uses the padded/truncated length
+
+        # --- Create Mask ---
+        # Mask should reflect the actual content length within the final tensor shape
+        mask = sequence_mask(final_lengths, max_length=max_length_for_mask)
+        mask = mask.unsqueeze(1).to(
+            self.device
+        )  # Add channel dim: (B, 1, max_length_for_mask)
 
         return emb_clean_input, emb_noisy_input, mask
 
@@ -77,17 +258,13 @@ class SEBrain(sb.Brain):
         # We first move the batch to the appropriate device, and
         # compute the features necessary for masking.
 
-        emb_noisy, emb_clean, mask = self.pad_and_transpose(batch)
+        emb_noisy, emb_clean, mask = self.pad_and_transpose(
+            batch, self.hparams.cut_segments
+        )
 
         if self.hparams.otcfm:
-            emb_noisy_agg = (
-                batch.emb_noisy.data.sum(dim=1)
-                / (batch.emb_noisy.lengths * emb_noisy.shape[1])[:, None]
-            )
-            emb_clean_agg = (
-                batch.emb_clean.data.sum(dim=1)
-                / (batch.emb_clean.lengths * emb_clean.shape[1])[:, None]
-            )
+            emb_noisy_agg = emb_noisy.sum(dim=1) / (mask.sum(dim=-1))[:, None]
+            emb_clean_agg = emb_clean.sum(dim=1) / (mask.sum(dim=-1))[:, None]
 
             _, _, label_x, label_y = self.hparams.ot_sampler.sample_plan_with_labels(
                 emb_noisy_agg,
@@ -157,25 +334,24 @@ class SEBrain(sb.Brain):
         if (stage != sb.Stage.TRAIN) and (
             self.epoch % self.hparams.validate_every == 0
         ):
-            txt_hyp, p1_pred_batch = self.inference(batch)
-
             hyps = predictions["hyps"]
-
-            import re
 
             pattern_unwanted = r"[^{}\s]".format(
                 "".join(re.escape(c) for c in self.labels)
             )
             target_words = [
-                re.sub(pattern_unwanted, "", wrd.upper()).split(" ")
-                for wrd in batch.wrd
+                [
+                    wrd
+                    for wrd in re.sub(pattern_unwanted, "", utt.upper()).split(" ")
+                    if wrd != ""
+                ]
+                for utt in batch.wrd
             ]
-            target_words = target_words
-
-            # eval noisy
 
             # Convert indices to words
-            predicted_words = [text.split("|") for text in hyps]
+            predicted_words = [
+                [wrd for wrd in text.split("|") if wrd != ""] for text in hyps
+            ]
 
             self.wer_stats.append(batch.id, predicted_words, target_words)
             self.cer_stats.append(batch.id, predicted_words, target_words)
@@ -331,7 +507,9 @@ class SEBrain(sb.Brain):
             return ut_pred * mask
 
         node = NeuralODE(vt, solver="euler", sensitivity="adjoint")
-        traj = node.trajectory(emb_noisy, t_span=torch.linspace(0, 1, 50))
+        traj = node.trajectory(
+            emb_noisy, t_span=torch.linspace(0, 1, self.hparams.n_ode_steps)
+        )
 
         emb_pred = traj[-1]
         traj.cpu()

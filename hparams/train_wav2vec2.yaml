@@ -69,6 +69,8 @@ ot_sampler: !new:torchcfm.optimal_transport.OTPlanSampler
 ot_replace: False
 otcfm: False # set true for ot minibatches
 
+n_ode_steps: 50
+
 
 # Training Parameters
 number_of_epochs: 20
@@ -82,6 +84,9 @@ dataloader_options:
 dataloader_options_eval:
     batch_size: !ref <batch_size_eval>
     num_workers: !ref <num_workers>
+
+cut_segments: False
+segment_length: 128
 
 
 # Model

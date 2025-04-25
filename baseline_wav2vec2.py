@@ -1,5 +1,6 @@
 import sys
 import os
+from pathlib import Path
 
 import torch
 from hyperpyyaml import load_hyperpyyaml
@@ -64,17 +65,22 @@ class SEBrain(sb.Brain):
             for batch in tqdm(dataset, dynamic_ncols=True):
                 emb_noisy = batch["emb_noisy"][None, :, :].to(self.device)
                 emb_clean = batch["emb_clean"][None, :, :].to(self.device)
-                target_words = batch["wrd"].upper()
-                target_words = re.sub(pattern_unwanted, "", target_words).split(" ")
-                target_words = [target_words]
+                target_words = [
+                    [
+                        wrd
+                        for wrd in re.sub(
+                            pattern_unwanted, "", batch["wrd"].upper()
+                        ).split(" ")
+                        if wrd != ""
+                    ]
+                ]
 
                 # eval noisy
                 emission = model.aux(emb_noisy)
                 predicted_words = decoder(emission[0])
-                predicted_words = [predicted_words]
-
-                # Convert indices to words
-                predicted_words = [text.split("|") for text in predicted_words]
+                predicted_words = [
+                    [wrd for wrd in predicted_words.split("|") if wrd != ""]
+                ]
 
                 wer_stats_noisy.append([batch["id"]], predicted_words, target_words)
                 cer_stats_noisy.append([batch["id"]], predicted_words, target_words)
@@ -82,10 +88,9 @@ class SEBrain(sb.Brain):
                 # eval clean
                 emission = model.aux(emb_clean)
                 predicted_words = decoder(emission[0])
-                predicted_words = [predicted_words]
-
-                # Convert indices to words
-                predicted_words = [text.split("|") for text in predicted_words]
+                predicted_words = [
+                    [wrd for wrd in predicted_words.split("|") if wrd != ""]
+                ]
 
                 wer_stats_clean.append([batch["id"]], predicted_words, target_words)
                 cer_stats_clean.append([batch["id"]], predicted_words, target_words)
@@ -95,7 +100,7 @@ class SEBrain(sb.Brain):
                 )
 
         save_root = os.path.join(self.hparams.save_folder, split)
-        os.mkdir(save_root)
+        Path(save_root).mkdir(exist_ok=True)
 
         with open(os.path.join(save_root, "p1_loss.txt"), "w") as f:
             p1_loss_metric.write_stats(f)
